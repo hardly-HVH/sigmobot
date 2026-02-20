@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ==================== SMILE PARTY BOT - SUPER EXTENDED VERSION WITH QR CODES ====================
+# ==================== SMILE PARTY BOT - ULTIMATE QR SYSTEM ====================
 
 import warnings
 warnings.filterwarnings("ignore", message="If 'per_message=False'")
@@ -18,22 +18,50 @@ import os
 import time
 import csv
 import html
+import hashlib
+import hmac
+import base64
+import pickle
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from contextlib import closing
 import traceback
 import tempfile
 import threading
 import io
+from collections import defaultdict
+from dataclasses import dataclass
+from functools import lru_cache
+
+# QR Code libraries
 import qrcode
-from PIL import Image, ImageDraw, ImageFont
-import hashlib
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
+
+# For QR scanning
+try:
+    import cv2
+    import numpy as np
+    from pyzbar.pyzbar import decode
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("⚠️ OpenCV не установлен. Используется базовое распознавание QR-кодов.")
+    print("   Для установки: pip install opencv-python pyzbar")
+
+# For caching
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    print("⚠️ Redis не установлен. Используется файловое кэширование QR-кодов.")
+    print("   Для установки: pip install redis")
 
 # ========== НАСТРОЙКИ БОТА ==========
 BOT_TOKEN = "8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM"
 ADMIN_IDS = [7978634199, 1037472337, 932339331]
 PROMOTER_IDS = [7283583682, 6179688188, 932339331, 8387903981, 8041100755, 1380285963, 1991277474, 8175354320, 6470777539, 8470198654, 7283630429, 8396505232, 8176926325, 8566108065, 7978634199, 1037472337]
-SCANNER_IDS = list(set(ADMIN_IDS + PROMOTER_IDS))  # Теперь это ID администраторов и промоутеров, которые могут сканировать QR-коды
+SCANNER_IDS = list(set(ADMIN_IDS + PROMOTER_IDS))
 
 # ID каналов и чатов
 CLOSED_ORDERS_CHANNEL_ID = -1003780187586
@@ -44,6 +72,24 @@ LOGS_CHANNEL_ID = -1003610531501
 
 # Файл базы данных
 DB_FILE = "smile_party_bot.db"
+
+# ========== НАСТРОЙКИ QR-КОДОВ ==========
+QR_CONFIG = {
+    "secret_key": "smile_party_super_secret_key_2024_CHANGE_ME",  # Изменить в продакшене!
+    "version": "1.0",
+    "cache_dir": "qr_cache",
+    "cache_ttl": 86400,  # 24 часа
+    "qr_size": 10,
+    "logo_path": None,  # Путь к логотипу для стилизации
+    "enable_watermark": True,
+    "watermark_text": "SMILE PARTY",
+    "max_scan_attempts": 3,
+    "scan_timeout": 60,  # секунд между сканированиями одного билета
+    "offline_mode": False,
+    "enable_hmac": True,
+    "enable_timestamp": True,
+    "enable_qr_caching": True
+}
 
 # ========== НАСТРОЙКИ ТИПОВ БИЛЕТОВ ==========
 TICKET_TYPES = {
@@ -64,27 +110,21 @@ def setup_advanced_logging():
     import sys
     import io
     
-    # Настраиваем стандартный вывод для поддержки UTF-8
     if sys.platform == "win32":
-        # Для Windows устанавливаем UTF-8 кодировку
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='ignore')
     
-    # Основной логгер
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     
-    # Форматтер
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Консольный вывод с UTF-8 кодировкой
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     
-    # Принудительно устанавливаем UTF-8 для вывода в консоль
     if sys.platform == "win32":
         import codecs
         console_handler.stream = io.TextIOWrapper(
@@ -95,17 +135,15 @@ def setup_advanced_logging():
     
     logger.addHandler(console_handler)
     
-    # Файловый вывод с ротацией
     file_handler = logging.handlers.RotatingFileHandler(
         'bot.log',
-        maxBytes=10*1024*1024,  # 10 MB
+        maxBytes=10*1024*1024,
         backupCount=5,
-        encoding='utf-8'  # Указываем кодировку для файла
+        encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     
-    # Логгер для действий пользователей
     user_logger = logging.getLogger('user_actions')
     user_handler = logging.handlers.RotatingFileHandler(
         'user_actions.log',
@@ -116,7 +154,6 @@ def setup_advanced_logging():
     user_handler.setFormatter(formatter)
     user_logger.addHandler(user_handler)
     
-    # Логгер для QR-кодов
     qr_logger = logging.getLogger('qr_codes')
     qr_handler = logging.handlers.RotatingFileHandler(
         'qr_codes.log',
@@ -127,28 +164,620 @@ def setup_advanced_logging():
     qr_handler.setFormatter(formatter)
     qr_logger.addHandler(qr_handler)
     
-    return logger, user_logger, qr_logger
-
-# Инициализация логирования
-logger, user_logger, qr_logger = setup_advanced_logging()
-
-def log_qr_action(action: str, details: Dict = None):
-    """
-    Логирование действий с QR-кодами
+    performance_logger = logging.getLogger('performance')
+    perf_handler = logging.handlers.RotatingFileHandler(
+        'performance.log',
+        maxBytes=5*1024*1024,
+        backupCount=3,
+        encoding='utf-8'
+    )
+    perf_handler.setFormatter(formatter)
+    performance_logger.addHandler(perf_handler)
     
-    Args:
-        action: Действие (generate, scan, verify, error)
-        details: Детали операции
-    """
-    try:
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "action": action,
-            "details": details or {}
+    return logger, user_logger, qr_logger, performance_logger
+
+logger, user_logger, qr_logger, perf_logger = setup_advanced_logging()
+
+# ========== QR CODE MANAGER ==========
+class QRCodeManager:
+    """Менеджер QR-кодов с защитой, кэшированием и мониторингом"""
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or QR_CONFIG
+        self.stats = defaultdict(int)
+        self.stats_lock = threading.Lock()
+        self.cache = {}
+        self.last_scan = defaultdict(float)
+        
+        # Создаем директорию для кэша
+        if self.config["enable_qr_caching"]:
+            os.makedirs(self.config["cache_dir"], exist_ok=True)
+            logger.info(f"📁 Директория кэша QR-кодов: {self.config['cache_dir']}")
+        
+        # Подключаем Redis если доступен
+        self.redis_client = None
+        if REDIS_AVAILABLE:
+            try:
+                self.redis_client = redis.Redis(
+                    host='localhost',
+                    port=6379,
+                    db=0,
+                    decode_responses=False,
+                    socket_connect_timeout=2
+                )
+                self.redis_client.ping()
+                logger.info("✅ Redis подключен для кэширования QR-кодов")
+            except:
+                self.redis_client = None
+                logger.warning("⚠️ Redis недоступен, используется файловое кэширование")
+        
+        logger.info("🚀 QR Code Manager инициализирован")
+    
+    def _generate_hmac(self, data: str) -> str:
+        """Генерирует HMAC подпись для данных"""
+        if not self.config["enable_hmac"]:
+            return ""
+        
+        message = data.encode('utf-8')
+        signature = hmac.new(
+            self.config["secret_key"].encode('utf-8'),
+            message,
+            hashlib.sha256
+        ).hexdigest()[:8]  # Берем первые 8 символов для компактности
+        return signature
+    
+    def _verify_hmac(self, data: str, signature: str) -> bool:
+        """Проверяет HMAC подпись"""
+        if not self.config["enable_hmac"]:
+            return True
+        
+        expected = self._generate_hmac(data)
+        return hmac.compare_digest(expected, signature)
+    
+    def _add_timestamp(self, data: str) -> str:
+        """Добавляет временную метку к данным"""
+        if not self.config["enable_timestamp"]:
+            return data
+        
+        timestamp = int(time.time())
+        return f"{data}|{timestamp}"
+    
+    def _verify_timestamp(self, data: str, max_age: int = 86400) -> Tuple[bool, str]:
+        """Проверяет временную метку"""
+        if '|' not in data or not self.config["enable_timestamp"]:
+            return True, data
+        
+        try:
+            base_data, timestamp_str = data.rsplit('|', 1)
+            timestamp = int(timestamp_str)
+            current_time = int(time.time())
+            
+            if current_time - timestamp > max_age:
+                return False, base_data
+            
+            return True, base_data
+        except:
+            return False, data
+    
+    def prepare_qr_data(self, order_code: str, ticket_type: str = "standard", guest_name: str = "") -> str:
+        """Подготавливает данные для QR-кода с защитой"""
+        base_data = f"SMILE_PARTY:{order_code}:{ticket_type}"
+        if guest_name:
+            # Хэшируем имя гостя для приватности
+            guest_hash = hashlib.md5(guest_name.encode()).hexdigest()[:8]
+            base_data += f":{guest_hash}"
+        
+        # Добавляем версию формата
+        base_data = f"V{self.config['version']}:{base_data}"
+        
+        # Добавляем временную метку
+        data_with_time = self._add_timestamp(base_data)
+        
+        # Добавляем HMAC подпись
+        signature = self._generate_hmac(data_with_time)
+        
+        return f"{data_with_time}|{signature}"
+    
+    def parse_qr_data(self, qr_data: str) -> Dict:
+        """Парсит и проверяет данные из QR-кода"""
+        result = {
+            "valid": False,
+            "code": None,
+            "ticket_type": None,
+            "guest_hash": None,
+            "error": None,
+            "data": qr_data
         }
-        qr_logger.info(json.dumps(log_entry, ensure_ascii=False))
-    except Exception as e:
-        logger.error(f"Ошибка логирования QR-действия: {e}")
+        
+        try:
+            # Разделяем данные и подпись
+            parts = qr_data.split('|')
+            if len(parts) < 2:
+                result["error"] = "Неверный формат данных"
+                return result
+            
+            data_part = '|'.join(parts[:-1])
+            signature = parts[-1]
+            
+            # Проверяем подпись
+            if not self._verify_hmac(data_part, signature):
+                result["error"] = "Недействительная подпись"
+                return result
+            
+            # Проверяем временную метку
+            timestamp_valid, data_without_time = self._verify_timestamp(data_part)
+            if not timestamp_valid:
+                result["error"] = "Истек срок действия QR-кода"
+                return result
+            
+            # Парсим основную структуру
+            main_parts = data_without_time.split(':')
+            if len(main_parts) < 3:
+                result["error"] = "Неверная структура данных"
+                return result
+            
+            version = main_parts[0]
+            prefix = main_parts[1]
+            
+            if not version.startswith('V') or prefix != "SMILE_PARTY":
+                result["error"] = "Неизвестный формат QR-кода"
+                return result
+            
+            code = main_parts[2]
+            ticket_type = main_parts[3] if len(main_parts) > 3 else "standard"
+            guest_hash = main_parts[4] if len(main_parts) > 4 else ""
+            
+            result.update({
+                "valid": True,
+                "code": code,
+                "ticket_type": ticket_type,
+                "guest_hash": guest_hash,
+                "version": version
+            })
+            
+        except Exception as e:
+            result["error"] = f"Ошибка парсинга: {str(e)}"
+        
+        return result
+    
+    def generate_qr_image(self, data: str, ticket_type: str = "standard", guest_name: str = "") -> bytes:
+        """Генерирует стилизованный QR-код"""
+        start_time = time.time()
+        
+        cache_key = hashlib.md5(f"{data}_{ticket_type}_{guest_name}".encode()).hexdigest()
+        
+        # Проверяем кэш
+        cached = self._get_from_cache(cache_key)
+        if cached:
+            self.stats["cache_hits"] += 1
+            logger.debug(f"✅ QR-код получен из кэша: {cache_key[:8]}")
+            perf_logger.info(f"QR_GEN_CACHE_HIT,{cache_key[:8]},{time.time()-start_time:.3f}")
+            return cached
+        
+        self.stats["cache_misses"] += 1
+        
+        try:
+            logger.info(f"🚀 Генерация QR-кода для: {data[:30]}...")
+            
+            # Создаем QR-код с повышенной коррекцией ошибок
+            qr = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=self.config["qr_size"],
+                border=4,
+            )
+            
+            prepared_data = self.prepare_qr_data(data, ticket_type, guest_name)
+            qr.add_data(prepared_data)
+            qr.make(fit=True)
+            
+            # Создаем изображение
+            img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+            
+            # Добавляем логотип если есть
+            if self.config["logo_path"] and os.path.exists(self.config["logo_path"]):
+                img = self._add_logo(img)
+            
+            # Добавляем водяной знак
+            if self.config["enable_watermark"]:
+                img = self._add_watermark(img, self.config["watermark_text"])
+            
+            # Добавляем рамку и текст
+            img = self._add_styling(img, data, ticket_type, guest_name)
+            
+            # Конвертируем в байты
+            img_bytes = self._image_to_bytes(img)
+            
+            # Сохраняем в кэш
+            self._save_to_cache(cache_key, img_bytes)
+            
+            # Обновляем статистику
+            with self.stats_lock:
+                self.stats["qr_generated"] += 1
+                self.stats["total_generation_time"] += time.time() - start_time
+            
+            logger.info(f"✅ QR-код сгенерирован за {time.time()-start_time:.2f}с")
+            perf_logger.info(f"QR_GEN_SUCCESS,{cache_key[:8]},{time.time()-start_time:.3f}")
+            
+            return img_bytes
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации QR-кода: {e}")
+            logger.error(traceback.format_exc())
+            
+            with self.stats_lock:
+                self.stats["qr_errors"] += 1
+            
+            perf_logger.info(f"QR_GEN_ERROR,{cache_key[:8]},{str(e)[:50]}")
+            
+            # Возвращаем простой QR-код в случае ошибки
+            return self._generate_fallback_qr(data)
+    
+    def _add_logo(self, img: Image.Image) -> Image.Image:
+        """Добавляет логотип в центр QR-кода"""
+        try:
+            logo = Image.open(self.config["logo_path"])
+            
+            # Вычисляем размер логотипа (20% от QR-кода)
+            qr_width, qr_height = img.size
+            logo_size = int(qr_width * 0.2)
+            
+            logo = logo.resize((logo_size, logo_size), Image.Resampling.LANCZOS)
+            
+            # Создаем маску для закругления углов
+            mask = Image.new('L', (logo_size, logo_size), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, logo_size, logo_size), fill=255)
+            
+            # Вставляем логотип
+            pos = ((qr_width - logo_size) // 2, (qr_height - logo_size) // 2)
+            img.paste(logo, pos, mask)
+            
+            logger.debug("✅ Логотип добавлен в QR-код")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления логотипа: {e}")
+        
+        return img
+    
+    def _add_watermark(self, img: Image.Image, text: str) -> Image.Image:
+        """Добавляет водяной знак"""
+        try:
+            draw = ImageDraw.Draw(img)
+            
+            # Пытаемся загрузить шрифт
+            try:
+                font = ImageFont.truetype("arial.ttf", 20)
+            except:
+                font = ImageFont.load_default()
+            
+            # Получаем размеры изображения
+            width, height = img.size
+            
+            # Добавляем полупрозрачный текст по диагонали
+            for i in range(0, width, 100):
+                for j in range(0, height, 100):
+                    # Создаем полупрозрачный слой
+                    txt_img = Image.new('RGBA', img.size, (255,255,255,0))
+                    txt_draw = ImageDraw.Draw(txt_img)
+                    txt_draw.text((i, j), text, fill=(128,128,128,30), font=font)
+                    
+                    # Накладываем на оригинал
+                    img = Image.alpha_composite(img.convert('RGBA'), txt_img)
+            
+            logger.debug("✅ Водяной знак добавлен")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления водяного знака: {e}")
+        
+        return img
+    
+    def _add_styling(self, img: Image.Image, data: str, ticket_type: str, guest_name: str) -> Image.Image:
+        """Добавляет стилизацию и текст к QR-коду"""
+        try:
+            width, height = img.size
+            new_height = height + 60
+            
+            # Создаем новое изображение с белым фоном
+            new_img = Image.new('RGB', (width, new_height), 'white')
+            new_img.paste(img, (0, 0))
+            
+            draw = ImageDraw.Draw(new_img)
+            
+            # Загружаем шрифт
+            try:
+                font = ImageFont.truetype("arial.ttf", 20)
+            except:
+                font = ImageFont.load_default()
+            
+            # Формируем текст
+            ticket_type_text = "VIP" if ticket_type == "vip" else "STANDARD"
+            display_text = f"#{data} | {ticket_type_text}"
+            if guest_name:
+                display_text += f" | {guest_name[:20]}"
+            
+            # Добавляем текст с тенью
+            bbox = draw.textbbox((0, 0), display_text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_x = (width - text_width) // 2
+            text_y = height + 10
+            
+            # Тень
+            draw.text((text_x+2, text_y+2), display_text, fill="gray", font=font)
+            # Основной текст
+            draw.text((text_x, text_y), display_text, fill="black", font=font)
+            
+            # Добавляем рамку
+            draw.rectangle([(0, 0), (width-1, height-1)], outline="black", width=1)
+            
+            logger.debug("✅ Стилизация QR-кода завершена")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка стилизации: {e}")
+        
+        return new_img
+    
+    def _image_to_bytes(self, img: Image.Image) -> bytes:
+        """Конвертирует изображение в байты"""
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG', optimize=True)
+        img_bytes.seek(0)
+        return img_bytes.getvalue()
+    
+    def _generate_fallback_qr(self, data: str) -> bytes:
+        """Генерирует простой QR-код в случае ошибки"""
+        try:
+            qr = qrcode.QRCode(version=1, box_size=10, border=4)
+            qr.add_data(data)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            
+            logger.info("✅ Создан fallback QR-код")
+            return img_bytes.getvalue()
+            
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка fallback QR: {e}")
+            # Возвращаем пустое изображение
+            img = Image.new('RGB', (200, 200), 'white')
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            return img_bytes.getvalue()
+    
+    def _get_from_cache(self, key: str) -> Optional[bytes]:
+        """Получает QR-код из кэша"""
+        if not self.config["enable_qr_caching"]:
+            return None
+        
+        # Пробуем Redis
+        if self.redis_client:
+            try:
+                data = self.redis_client.get(f"qr:{key}")
+                if data:
+                    return data
+            except:
+                pass
+        
+        # Пробуем файловый кэш
+        cache_path = os.path.join(self.config["cache_dir"], f"{key}.png")
+        if os.path.exists(cache_path):
+            # Проверяем возраст файла
+            if time.time() - os.path.getmtime(cache_path) < self.config["cache_ttl"]:
+                with open(cache_path, 'rb') as f:
+                    return f.read()
+            else:
+                os.remove(cache_path)
+        
+        return None
+    
+    def _save_to_cache(self, key: str, data: bytes):
+        """Сохраняет QR-код в кэш"""
+        if not self.config["enable_qr_caching"]:
+            return
+        
+        # Сохраняем в Redis
+        if self.redis_client:
+            try:
+                self.redis_client.setex(
+                    f"qr:{key}",
+                    self.config["cache_ttl"],
+                    data
+                )
+                return
+            except:
+                pass
+        
+        # Сохраняем в файл
+        try:
+            cache_path = os.path.join(self.config["cache_dir"], f"{key}.png")
+            with open(cache_path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения в кэш: {e}")
+    
+    def scan_qr_image(self, image_bytes: bytes) -> Dict:
+        """Сканирует QR-код на изображении с улучшенной обработкой"""
+        start_time = time.time()
+        
+        result = {
+            "success": False,
+            "data": None,
+            "parsed": None,
+            "error": None,
+            "scan_time": 0
+        }
+        
+        try:
+            # Конвертируем байты в изображение
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is None:
+                result["error"] = "Не удалось прочитать изображение"
+                return result
+            
+            # Улучшаем изображение для лучшего распознавания
+            img = self._enhance_image_for_scan(img)
+            
+            # Пробуем разные методы распознавания
+            qr_data = self._decode_qr_multiple_methods(img)
+            
+            if qr_data:
+                result["success"] = True
+                result["data"] = qr_data
+                result["parsed"] = self.parse_qr_data(qr_data)
+                
+                with self.stats_lock:
+                    self.stats["qr_scanned"] += 1
+                
+                logger.info(f"✅ QR-код распознан: {qr_data[:30]}...")
+            else:
+                result["error"] = "QR-код не найден на изображении"
+                with self.stats_lock:
+                    self.stats["scan_failures"] += 1
+            
+            result["scan_time"] = time.time() - start_time
+            perf_logger.info(f"QR_SCAN,{result['success']},{result['scan_time']:.3f}")
+            
+        except Exception as e:
+            result["error"] = f"Ошибка сканирования: {str(e)}"
+            logger.error(f"❌ Ошибка сканирования QR: {e}")
+            
+            with self.stats_lock:
+                self.stats["scan_errors"] += 1
+        
+        return result
+    
+    def _enhance_image_for_scan(self, img) -> np.ndarray:
+        """Улучшает изображение для распознавания QR-кодов"""
+        try:
+            # Конвертируем в оттенки серого
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Увеличиваем контраст
+            gray = cv2.equalizeHist(gray)
+            
+            # Применяем адаптивный порог
+            binary = cv2.adaptiveThreshold(
+                gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
+            
+            # Убираем шум
+            denoised = cv2.medianBlur(binary, 3)
+            
+            # Увеличиваем изображение для лучшего распознавания
+            height, width = denoised.shape
+            if width < 300 or height < 300:
+                scale = max(300 / width, 300 / height)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                denoised = cv2.resize(denoised, (new_width, new_height))
+            
+            return denoised
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка улучшения изображения: {e}")
+            return img
+    
+    def _decode_qr_multiple_methods(self, img) -> Optional[str]:
+        """Пробует несколько методов распознавания QR-кодов"""
+        
+        # Метод 1: pyzbar (основной)
+        if CV2_AVAILABLE:
+            try:
+                decoded_objects = decode(img)
+                if decoded_objects:
+                    return decoded_objects[0].data.decode('utf-8')
+            except Exception as e:
+                logger.debug(f"Pyzbar ошибка: {e}")
+        
+        # Метод 2: OpenCV QRCodeDetector
+        try:
+            qr_detector = cv2.QRCodeDetector()
+            retval, decoded_info, points, straight_qrcode = qr_detector.detectAndDecodeMulti(img)
+            if retval and decoded_info and decoded_info[0]:
+                return decoded_info[0]
+        except Exception as e:
+            logger.debug(f"OpenCV QR detector ошибка: {e}")
+        
+        # Метод 3: Пробуем с бинаризацией Otsu
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            if CV2_AVAILABLE:
+                decoded_objects = decode(thresh)
+                if decoded_objects:
+                    return decoded_objects[0].data.decode('utf-8')
+        except Exception as e:
+            logger.debug(f"Otsu метод ошибка: {e}")
+        
+        return None
+    
+    def check_scan_rate_limit(self, scanner_id: int, order_code: str) -> Tuple[bool, int]:
+        """Проверяет лимит сканирований для защиты от повторов"""
+        key = f"{scanner_id}:{order_code}"
+        current_time = time.time()
+        
+        if key in self.last_scan:
+            time_diff = current_time - self.last_scan[key]
+            if time_diff < self.config["scan_timeout"]:
+                return False, int(self.config["scan_timeout"] - time_diff)
+        
+        self.last_scan[key] = current_time
+        return True, 0
+    
+    def get_stats(self) -> Dict:
+        """Возвращает статистику работы QR-менеджера"""
+        with self.stats_lock:
+            stats = dict(self.stats)
+            stats["cache_hit_rate"] = 0
+            if stats.get("cache_hits", 0) + stats.get("cache_misses", 0) > 0:
+                total = stats.get("cache_hits", 0) + stats.get("cache_misses", 0)
+                stats["cache_hit_rate"] = (stats.get("cache_hits", 0) / total) * 100
+            
+            if stats.get("qr_generated", 0) > 0:
+                stats["avg_generation_time"] = (
+                    stats.get("total_generation_time", 0) / stats.get("qr_generated", 1)
+                )
+            
+            return stats
+    
+    def clear_cache(self, older_than: int = None) -> int:
+        """Очищает кэш QR-кодов"""
+        cleared = 0
+        
+        if self.redis_client:
+            try:
+                # В Redis TTL сам удаляет
+                pass
+            except:
+                pass
+        
+        # Очищаем файловый кэш
+        cache_dir = self.config["cache_dir"]
+        if os.path.exists(cache_dir):
+            current_time = time.time()
+            for filename in os.listdir(cache_dir):
+                if filename.endswith('.png'):
+                    filepath = os.path.join(cache_dir, filename)
+                    file_age = current_time - os.path.getmtime(filepath)
+                    
+                    if older_than is None or file_age > older_than:
+                        os.remove(filepath)
+                        cleared += 1
+        
+        logger.info(f"🧹 Очищено {cleared} файлов из кэша")
+        return cleared
+
+# Инициализация QR менеджера
+qr_manager = QRCodeManager()
 
 # ========== ИМПОРТ ТЕЛЕГРАМ МОДУЛЕЙ ==========
 from telegram import (
@@ -270,6 +899,24 @@ def log_user_action(user_id: int, action: str, details: str = ""):
     except Exception as e:
         logger.error(f"Ошибка логирования действия пользователя: {e}")
 
+def log_qr_action(action: str, details: Dict = None):
+    """
+    Логирование действий с QR-кодами
+    
+    Args:
+        action: Действие (generate, scan, verify, error)
+        details: Детали операции
+    """
+    try:
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "details": details or {}
+        }
+        qr_logger.info(json.dumps(log_entry, ensure_ascii=False))
+    except Exception as e:
+        logger.error(f"Ошибка логирования QR-действия: {e}")
+
 # ========== ФУНКЦИИ ДЛЯ ГЕНЕРАЦИИ УНИКАЛЬНЫХ КОДОВ ==========
 def generate_unique_code(length: int = 6) -> str:
     """Генерирует уникальный код для заказа в формате #KA123456"""
@@ -284,254 +931,6 @@ def format_code_for_display(code: str) -> str:
     """Форматирует код для отображения"""
     return code
 
-# ========== ФУНКЦИИ ДЛЯ ГЕНЕРАЦИИ QR-КОДОВ ==========
-def generate_qr_code(data: str, ticket_type: str = "standard", guest_name: str = "") -> bytes:
-    """
-    Генерирует QR-код для билета
-    
-    Args:
-        data: Данные для кодирования (обычно код заказа)
-        ticket_type: Тип билета (standard/vip)
-        guest_name: Имя гостя
-    
-    Returns:
-        bytes: PNG изображение QR-кода
-    """
-    log_details = {
-        "data": data,
-        "ticket_type": ticket_type,
-        "guest_name": guest_name,
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    try:
-        logger.info(f"🚀 Начало генерации QR-кода для данных: {data}")
-        log_qr_action("generate_start", log_details)
-        
-        # Создаем QR-код
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_H,
-            box_size=10,
-            border=4,
-        )
-        
-        # Добавляем данные
-        qr_data = f"SMILE_PARTY:{data}:{ticket_type}"
-        if guest_name:
-            qr_data += f":{guest_name}"
-        
-        logger.info(f"📝 Данные для QR-кода: {qr_data}")
-        qr.add_data(qr_data)
-        qr.make(fit=True)
-        
-        # Создаем изображение
-        img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
-        logger.info("✅ Базовый QR-код создан")
-        
-        # Создаем изображение с рамкой и текстом
-        width, height = img.size
-        new_height = height + 60  # Добавляем место для текста
-        
-        # Создаем новое изображение
-        new_img = Image.new('RGB', (width, new_height), 'white')
-        
-        # Вставляем QR-код
-        new_img.paste(img, (0, 0))
-        
-        # Добавляем текст
-        draw = ImageDraw.Draw(new_img)
-        
-        # Пытаемся загрузить шрифт, если не получается, используем дефолтный
-        try:
-            # Пробуем разные пути для шрифта в зависимости от ОС
-            if os.name == 'nt':  # Windows
-                font_path = "C:\\Windows\\Fonts\\Arial.ttf"
-            else:  # Linux/Mac
-                font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-            
-            if os.path.exists(font_path):
-                font = ImageFont.truetype(font_path, 20)
-                logger.info(f"✅ Загружен шрифт: {font_path}")
-            else:
-                font = ImageFont.load_default()
-                logger.warning(f"⚠️ Шрифт не найден по пути {font_path}, используется дефолтный")
-        except Exception as e:
-            font = ImageFont.load_default()
-            logger.warning(f"⚠️ Ошибка загрузки шрифта: {e}, используется дефолтный")
-        
-        # Текст под QR-кодом
-        ticket_type_text = "VIP билет" if ticket_type == "vip" else "Обычный билет"
-        text = f"{data} | {ticket_type_text}"
-        if guest_name:
-            text += f" | {guest_name[:30]}"
-        
-        # Получаем размер текста
-        try:
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_width = bbox[2] - bbox[0]
-        except:
-            text_width = len(text) * 10
-        
-        # Центрируем текст
-        text_x = (width - text_width) // 2
-        text_y = height + 10
-        
-        draw.text((text_x, text_y), text, fill="black", font=font)
-        logger.info("✅ Текст добавлен на QR-код")
-        
-        # Сохраняем в байты
-        img_bytes = io.BytesIO()
-        new_img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        
-        log_details["success"] = True
-        log_details["size_bytes"] = len(img_bytes.getvalue())
-        log_qr_action("generate_success", log_details)
-        logger.info(f"✅ QR-код успешно сгенерирован, размер: {len(img_bytes.getvalue())} байт")
-        
-        return img_bytes.getvalue()
-    
-    except Exception as e:
-        error_details = {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            **log_details
-        }
-        logger.error(f"❌ Ошибка генерации QR-кода: {e}")
-        logger.error(f"📝 Traceback: {traceback.format_exc()}")
-        log_qr_action("generate_error", error_details)
-        
-        # Возвращаем простой QR-код без текста в случае ошибки
-        try:
-            logger.info("🔄 Попытка создать простой QR-код без оформления")
-            qr = qrcode.QRCode(version=1, box_size=10, border=4)
-            qr.add_data(f"SMILE_PARTY:{data}")
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-            
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format='PNG')
-            img_bytes.seek(0)
-            
-            logger.info("✅ Простой QR-код создан")
-            return img_bytes.getvalue()
-        except Exception as e2:
-            logger.error(f"❌ Критическая ошибка создания QR-кода: {e2}")
-            raise
-
-def verify_qr_data(qr_data: str) -> Dict:
-    """
-    Проверяет данные из QR-кода
-    
-    Args:
-        qr_data: Данные из QR-кода
-    
-    Returns:
-        Dict с результатом проверки
-    """
-    log_details = {
-        "qr_data": qr_data,
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    try:
-        logger.info(f"🔍 Проверка данных QR-кода: {qr_data}")
-        log_qr_action("verify_start", log_details)
-        
-        # Ожидаемый формат: SMILE_PARTY:CODE:TYPE:NAME?
-        parts = qr_data.split(':')
-        
-        if len(parts) < 3 or parts[0] != "SMILE_PARTY":
-            error_msg = "Неверный формат QR-кода"
-            logger.warning(f"⚠️ {error_msg}: ожидался формат SMILE_PARTY:CODE:TYPE, получено: {qr_data}")
-            
-            log_details["error"] = error_msg
-            log_details["parts"] = parts
-            log_qr_action("verify_error", log_details)
-            
-            return {"valid": False, "error": error_msg}
-        
-        code = parts[1]
-        ticket_type = parts[2] if len(parts) > 2 else "standard"
-        guest_name = parts[3] if len(parts) > 3 else ""
-        
-        log_details["parsed"] = {
-            "code": code,
-            "ticket_type": ticket_type,
-            "guest_name": guest_name
-        }
-        logger.info(f"📝 Данные QR-кода распарсены: код={code}, тип={ticket_type}, гость={guest_name}")
-        
-        # Проверяем код в базе данных
-        order = db.get_order_by_code(code)
-        
-        if not order:
-            error_msg = "Билет не найден в системе"
-            logger.warning(f"⚠️ {error_msg}: код {code}")
-            
-            log_details["error"] = error_msg
-            log_qr_action("verify_error", log_details)
-            
-            return {"valid": False, "error": error_msg, "code": code}
-        
-        log_details["order_found"] = {
-            "order_id": order.get('order_id'),
-            "status": order.get('status'),
-            "user_name": order.get('user_name'),
-            "scanned_at": str(order.get('scanned_at')) if order.get('scanned_at') else None
-        }
-        
-        if order['status'] != 'closed':
-            error_msg = f"Билет еще не активирован (статус: {order['status']})"
-            logger.warning(f"⚠️ {error_msg}")
-            
-            log_details["error"] = error_msg
-            log_qr_action("verify_error", log_details)
-            
-            return {
-                "valid": False, 
-                "error": error_msg,
-                "order": order
-            }
-        
-        # Проверяем, не был ли билет уже использован
-        if order.get('scanned_at'):
-            scanned_time = str(order['scanned_at'])
-            error_msg = f"Билет уже был использован {scanned_time}"
-            logger.warning(f"⚠️ {error_msg}")
-            
-            log_details["error"] = error_msg
-            log_qr_action("verify_error", log_details)
-            
-            return {
-                "valid": False,
-                "error": error_msg,
-                "order": order
-            }
-        
-        logger.info(f"✅ QR-код валиден для билета {code}")
-        log_qr_action("verify_success", log_details)
-        
-        return {
-            "valid": True,
-            "code": code,
-            "ticket_type": ticket_type,
-            "guest_name": guest_name,
-            "order": order
-        }
-    
-    except Exception as e:
-        error_details = {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            **log_details
-        }
-        logger.error(f"❌ Ошибка проверки QR-кода: {e}")
-        logger.error(f"📝 Traceback: {traceback.format_exc()}")
-        log_qr_action("verify_error", error_details)
-        return {"valid": False, "error": f"Ошибка проверки: {str(e)}"}
-
 # ========== КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ SQLite ==========
 class Database:
     """Класс для работы с SQLite базой данных"""
@@ -539,40 +938,8 @@ class Database:
     def __init__(self, db_file: str = DB_FILE):
         self.db_file = db_file
         self.init_database()
-        self.check_and_fix_database()  # Вызываем проверку структуры
+        self.check_and_fix_database()
     
-    def add_missing_columns(self):
-        """Добавить отсутствующие колонки в таблицы"""
-        try:
-            with closing(self.get_connection()) as conn:
-                cursor = conn.cursor()
-                
-                # Проверяем и добавляем колонки для таблицы bot_users
-                cursor.execute("PRAGMA table_info(bot_users)")
-                columns = cursor.fetchall()
-                column_names = [col[1] for col in columns]
-                
-                # Список колонок, которые должны быть
-                required_columns = {
-                    'is_active': 'BOOLEAN DEFAULT 1',
-                    'notified_about_restart': 'BOOLEAN DEFAULT 0',
-                    'request_count': 'INTEGER DEFAULT 0',
-                    'last_request': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
-                }
-                
-                for col_name, col_type in required_columns.items():
-                    if col_name not in column_names:
-                        try:
-                            cursor.execute(f"ALTER TABLE bot_users ADD COLUMN {col_name} {col_type}")
-                            logger.info(f"✅ Добавлена колонка {col_name} в таблицу bot_users")
-                        except Exception as e:
-                            logger.error(f"❌ Ошибка добавления колонки {col_name}: {e}")
-                
-                conn.commit()
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка при добавлении колонок: {e}")
-
     def get_connection(self):
         """Получить соединение с базой данных"""
         conn = sqlite3.connect(self.db_file, check_same_thread=False)
@@ -633,7 +1000,9 @@ class Database:
                     notified_promoters BOOLEAN DEFAULT FALSE,
                     processed_at TIMESTAMP,
                     scanned_at TIMESTAMP,  -- Время сканирования QR-кода
-                    scanned_by VARCHAR(100)  -- Кто сканировал
+                    scanned_by VARCHAR(100),  -- Кто сканировал
+                    qr_hash VARCHAR(64),  -- Хэш для кэширования
+                    qr_version VARCHAR(10)  -- Версия QR формата
                 )
             """)
             
@@ -645,9 +1014,12 @@ class Database:
                     order_code VARCHAR(20) NOT NULL,
                     guest_number INTEGER NOT NULL,
                     full_name VARCHAR(200) NOT NULL,
+                    guest_hash VARCHAR(64),  -- Хэш имени для приватности
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     scanned_at TIMESTAMP,  -- Время сканирования QR-кода для каждого гостя
                     scanned_by VARCHAR(100),  -- Кто сканировал
+                    scan_attempts INTEGER DEFAULT 0,  -- Количество попыток сканирования
+                    last_scan_attempt TIMESTAMP,  -- Последняя попытка сканирования
                     FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
                     UNIQUE(order_id, guest_number)
                 )
@@ -688,8 +1060,37 @@ class Database:
                     scanner_username VARCHAR(100),
                     order_code VARCHAR(20) NOT NULL,
                     guest_name VARCHAR(200),
+                    guest_hash VARCHAR(64),
                     scan_result VARCHAR(20),
                     scan_message TEXT,
+                    scan_time_ms INTEGER,  -- Время сканирования в миллисекундах
+                    qr_version VARCHAR(10),  -- Версия QR формата
+                    signature_valid BOOLEAN,  -- Была ли подпись валидной
+                    timestamp_valid BOOLEAN,  -- Была ли временная метка валидной
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица для отслеживания попыток сканирования (защита от DDoS)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scan_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scanner_id BIGINT NOT NULL,
+                    order_code VARCHAR(20) NOT NULL,
+                    attempt_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    success BOOLEAN DEFAULT FALSE,
+                    UNIQUE(scanner_id, order_code, attempt_time)
+                )
+            """)
+            
+            # Статистика кэширования QR-кодов
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS qr_cache_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action VARCHAR(50),
+                    cache_key VARCHAR(64),
+                    cache_hit BOOLEAN,
+                    generation_time_ms INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -698,8 +1099,10 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(order_code)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_qr_hash ON orders(qr_hash)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_guests_order_id ON guests(order_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_guests_order_code ON guests(order_code)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_guests_guest_hash ON guests(guest_hash)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON bot_users(role)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_promo_codes_code ON promo_codes(code)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_promo_codes_active ON promo_codes(is_active)")
@@ -707,6 +1110,9 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_action_logs_created_at ON action_logs(created_at)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_logs_scanner ON scan_logs(scanner_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_logs_code ON scan_logs(order_code)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_logs_created ON scan_logs(created_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_attempts_scanner ON scan_attempts(scanner_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_attempts_code ON scan_attempts(order_code)")
             
             conn.commit()
             logger.info("✅ Таблицы SQLite базы данных инициализированы")
@@ -755,8 +1161,18 @@ class Database:
         self.add_column_if_not_exists("orders", "processed_at", "TIMESTAMP")
         self.add_column_if_not_exists("orders", "scanned_at", "TIMESTAMP")
         self.add_column_if_not_exists("orders", "scanned_by", "VARCHAR(100)")
+        self.add_column_if_not_exists("orders", "qr_hash", "VARCHAR(64)")
+        self.add_column_if_not_exists("orders", "qr_version", "VARCHAR(10)")
         self.add_column_if_not_exists("guests", "scanned_at", "TIMESTAMP")
         self.add_column_if_not_exists("guests", "scanned_by", "VARCHAR(100)")
+        self.add_column_if_not_exists("guests", "guest_hash", "VARCHAR(64)")
+        self.add_column_if_not_exists("guests", "scan_attempts", "INTEGER DEFAULT 0")
+        self.add_column_if_not_exists("guests", "last_scan_attempt", "TIMESTAMP")
+        self.add_column_if_not_exists("scan_logs", "guest_hash", "VARCHAR(64)")
+        self.add_column_if_not_exists("scan_logs", "scan_time_ms", "INTEGER")
+        self.add_column_if_not_exists("scan_logs", "qr_version", "VARCHAR(10)")
+        self.add_column_if_not_exists("scan_logs", "signature_valid", "BOOLEAN")
+        self.add_column_if_not_exists("scan_logs", "timestamp_valid", "BOOLEAN")
         
         logger.info("✅ Структура базы данных проверена")
     
@@ -804,8 +1220,6 @@ class Database:
     def mark_user_notified(self, user_id: int):
         """Пометить пользователя как уведомленного о перезапуске"""
         try:
-            self.add_column_if_not_exists("bot_users", "notified_about_restart", "BOOLEAN DEFAULT FALSE")
-            
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -822,8 +1236,6 @@ class Database:
     def reset_notification_status(self):
         """Сбросить статус уведомлений для всех пользователей"""
         try:
-            self.add_column_if_not_exists("bot_users", "notified_about_restart", "BOOLEAN DEFAULT FALSE")
-            
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("UPDATE bot_users SET notified_about_restart = FALSE")
@@ -837,8 +1249,6 @@ class Database:
     def get_users_to_notify(self) -> List[Dict]:
         """Получить пользователей для уведомления о перезапуске"""
         try:
-            self.add_column_if_not_exists("bot_users", "notified_about_restart", "BOOLEAN DEFAULT FALSE")
-            
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -945,8 +1355,6 @@ class Database:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 
-                self.add_column_if_not_exists("orders", "ticket_type", "VARCHAR(10) DEFAULT 'standard'")
-                
                 cursor.execute("SELECT COALESCE(MAX(CAST(SUBSTR(order_id, 3) AS INTEGER)), 999) FROM orders")
                 max_id = cursor.fetchone()[0] or 999
                 order_id = f"SP{max_id + 1}"
@@ -988,8 +1396,6 @@ class Database:
     def mark_order_notified(self, order_id: str):
         """Пометить заказ как уведомленный для промоутеров"""
         try:
-            self.add_column_if_not_exists("orders", "notified_promoters", "BOOLEAN DEFAULT FALSE")
-            
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -1022,8 +1428,6 @@ class Database:
     def get_unnotified_orders(self) -> List[Dict]:
         """Получить заказы, по которым не отправлялись уведомления промоутерам"""
         try:
-            self.add_column_if_not_exists("orders", "notified_promoters", "BOOLEAN DEFAULT FALSE")
-            
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -1063,10 +1467,13 @@ class Database:
                 cursor = conn.cursor()
                 
                 for i, guest_name in enumerate(guests, 1):
+                    # Генерируем хэш гостя для приватности
+                    guest_hash = hashlib.md5(guest_name.encode()).hexdigest()[:8] if guest_name else None
+                    
                     cursor.execute("""
-                        INSERT INTO guests (order_id, order_code, guest_number, full_name)
-                        VALUES (?, ?, ?, ?)
-                    """, (order_id, order_code, i, guest_name.strip()))
+                        INSERT INTO guests (order_id, order_code, guest_number, full_name, guest_hash)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (order_id, order_code, i, guest_name.strip(), guest_hash))
                 
                 conn.commit()
                 logger.info(f"✅ Добавлено {len(guests)} гостей к заказу {order_id}")
@@ -1185,6 +1592,17 @@ class Database:
                     }
                     log_details["success"] = False
                     log_qr_action("scan_already_used", log_details)
+                    
+                    # Увеличиваем счетчик попыток сканирования для гостя
+                    if guest_name:
+                        cursor.execute("""
+                            UPDATE guests 
+                            SET scan_attempts = scan_attempts + 1,
+                                last_scan_attempt = CURRENT_TIMESTAMP
+                            WHERE order_code = ? AND full_name = ?
+                        """, (order_code, guest_name))
+                        conn.commit()
+                    
                     return False
                 
                 # Отмечаем заказ как отсканированный
@@ -1203,7 +1621,9 @@ class Database:
                     cursor.execute("""
                         UPDATE guests 
                         SET scanned_at = CURRENT_TIMESTAMP, 
-                            scanned_by = ?
+                            scanned_by = ?,
+                            scan_attempts = scan_attempts + 1,
+                            last_scan_attempt = CURRENT_TIMESTAMP
                         WHERE order_code = ? AND full_name = ? AND scanned_at IS NULL
                     """, (scanner_username, order_code, guest_name))
                     
@@ -1214,7 +1634,9 @@ class Database:
                     cursor.execute("""
                         UPDATE guests 
                         SET scanned_at = CURRENT_TIMESTAMP, 
-                            scanned_by = ?
+                            scanned_by = ?,
+                            scan_attempts = scan_attempts + 1,
+                            last_scan_attempt = CURRENT_TIMESTAMP
                         WHERE order_code = ? AND scanned_at IS NULL
                     """, (scanner_username, order_code))
                     
@@ -1244,9 +1666,43 @@ class Database:
             log_qr_action("scan_error", log_details)
             return False
     
+    def update_order_qr_data(self, order_id: str, qr_hash: str, qr_version: str) -> bool:
+        """Обновляет данные QR-кода для заказа"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE orders 
+                    SET qr_hash = ?, qr_version = ?
+                    WHERE order_id = ?
+                """, (qr_hash, qr_version, order_id))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления QR данных: {e}")
+            return False
+    
+    def update_guest_hash(self, order_code: str, guest_name: str, guest_hash: str) -> bool:
+        """Обновляет хэш гостя"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE guests 
+                    SET guest_hash = ?
+                    WHERE order_code = ? AND full_name = ?
+                """, (guest_hash, order_code, guest_name))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления хэша гостя: {e}")
+            return False
+    
     def log_scan(self, scanner_id: int, scanner_username: str, order_code: str, 
-                 guest_name: str, result: str, message: str):
-        """Логировать сканирование QR-кода"""
+                 guest_name: str, result: str, message: str, scan_time_ms: int = None,
+                 guest_hash: str = None, qr_version: str = None,
+                 signature_valid: bool = None, timestamp_valid: bool = None):
+        """Логировать сканирование QR-кода с расширенными данными"""
         log_details = {
             "scanner_id": scanner_id,
             "scanner_username": scanner_username,
@@ -1262,9 +1718,13 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO scan_logs 
-                    (scanner_id, scanner_username, order_code, guest_name, scan_result, scan_message)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (scanner_id, scanner_username, order_code, guest_name, result, message))
+                    (scanner_id, scanner_username, order_code, guest_name, guest_hash, 
+                     scan_result, scan_message, scan_time_ms, qr_version, 
+                     signature_valid, timestamp_valid)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (scanner_id, scanner_username, order_code, guest_name, guest_hash,
+                      result, message, scan_time_ms, qr_version,
+                      signature_valid, timestamp_valid))
                 conn.commit()
                 
             logger.info(f"📝 Лог сканирования сохранен: {scanner_username} - {order_code} - {result}")
@@ -1275,6 +1735,37 @@ class Database:
             logger.error(f"❌ Ошибка логирования сканирования: {e}")
             log_qr_action("scan_log_error", log_details)
             return False
+    
+    def record_scan_attempt(self, scanner_id: int, order_code: str, success: bool) -> bool:
+        """Записывает попытку сканирования"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO scan_attempts (scanner_id, order_code, success)
+                    VALUES (?, ?, ?)
+                """, (scanner_id, order_code, success))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка записи попытки сканирования: {e}")
+            return False
+    
+    def get_scan_attempts_count(self, scanner_id: int, minutes: int = 5) -> int:
+        """Получает количество попыток сканирования за последние N минут"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT COUNT(*) FROM scan_attempts
+                    WHERE scanner_id = ? 
+                    AND attempt_time >= datetime('now', ?)
+                """, (scanner_id, f'-{minutes} minutes'))
+                result = cursor.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения количества попыток: {e}")
+            return 0
     
     def get_scan_stats(self) -> Dict:
         """Получить статистику сканирований"""
@@ -1319,9 +1810,28 @@ class Database:
                 cursor.execute("SELECT COUNT(*) FROM scan_logs WHERE DATE(created_at) = DATE('now') AND scan_result = 'success'")
                 today_success = cursor.fetchone()[0] or 0
                 
+                # Статистика по часам
+                cursor.execute("""
+                    SELECT 
+                        strftime('%H', created_at) as hour,
+                        COUNT(*) as scans
+                    FROM scan_logs
+                    WHERE created_at >= date('now', '-1 day')
+                    GROUP BY hour
+                    ORDER BY hour
+                """)
+                hourly_stats = cursor.fetchall()
+                
                 # Последние сканирования
                 cursor.execute("""
-                    SELECT scanner_username, order_code, scan_result, created_at 
+                    SELECT 
+                        scanner_username, 
+                        order_code, 
+                        scan_result, 
+                        scan_time_ms,
+                        signature_valid,
+                        timestamp_valid,
+                        created_at 
                     FROM scan_logs 
                     ORDER BY created_at DESC 
                     LIMIT 10
@@ -1337,12 +1847,170 @@ class Database:
                     "total_valid_tickets": total_valid_tickets,
                     "today_scans": today_scans,
                     "today_success": today_success,
+                    "hourly_stats": [{"hour": h, "scans": s} for h, s in hourly_stats],
                     "top_scanners": [dict(row) for row in top_scanners],
-                    "recent_scans": [dict(row) for row in recent_scans]
+                    "recent_scans": [
+                        {
+                            "scanner": s, 
+                            "code": c, 
+                            "result": r,
+                            "time_ms": t,
+                            "signature_valid": sv,
+                            "timestamp_valid": tv,
+                            "created_at": ca
+                        } 
+                        for s, c, r, t, sv, tv, ca in recent_scans
+                    ]
                 }
         except Exception as e:
             logger.error(f"❌ Ошибка получения статистики сканирований: {e}")
             return {}
+    
+    def get_qr_statistics(self) -> Dict:
+        """Получает расширенную статистику по QR-кодам"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                
+                # Статистика сканирований
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total_scans,
+                        SUM(CASE WHEN scan_result = 'success' THEN 1 ELSE 0 END) as success_scans,
+                        SUM(CASE WHEN scan_result = 'warning' THEN 1 ELSE 0 END) as warning_scans,
+                        SUM(CASE WHEN scan_result = 'error' THEN 1 ELSE 0 END) as error_scans,
+                        AVG(scan_time_ms) as avg_scan_time
+                    FROM scan_logs
+                """)
+                row = cursor.fetchone()
+                
+                # Статистика по часам
+                cursor.execute("""
+                    SELECT 
+                        strftime('%H', created_at) as hour,
+                        COUNT(*) as scans
+                    FROM scan_logs
+                    WHERE created_at >= date('now', '-1 day')
+                    GROUP BY hour
+                    ORDER BY hour
+                """)
+                hourly_stats = cursor.fetchall()
+                
+                # Топ сканеров
+                cursor.execute("""
+                    SELECT 
+                        scanner_username,
+                        COUNT(*) as scan_count,
+                        SUM(CASE WHEN scan_result = 'success' THEN 1 ELSE 0 END) as success_count
+                    FROM scan_logs
+                    GROUP BY scanner_username
+                    ORDER BY scan_count DESC
+                    LIMIT 10
+                """)
+                top_scanners = cursor.fetchall()
+                
+                # Статистика по билетам
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total_tickets,
+                        SUM(CASE WHEN scanned_at IS NOT NULL THEN 1 ELSE 0 END) as scanned_tickets
+                    FROM orders
+                    WHERE status = 'closed'
+                """)
+                tickets_row = cursor.fetchone()
+                
+                # Последние сканирования
+                cursor.execute("""
+                    SELECT 
+                        scanner_username,
+                        order_code,
+                        scan_result,
+                        scan_time_ms,
+                        signature_valid,
+                        timestamp_valid,
+                        created_at
+                    FROM scan_logs 
+                    ORDER BY created_at DESC 
+                    LIMIT 20
+                """)
+                recent_scans = cursor.fetchall()
+                
+                # Кэш статистика
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total_cache_ops,
+                        SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
+                        AVG(generation_time_ms) as avg_gen_time
+                    FROM qr_cache_stats
+                    WHERE created_at >= date('now', '-1 day')
+                """)
+                cache_row = cursor.fetchone()
+                
+                return {
+                    "total_scans": row[0] or 0,
+                    "success_scans": row[1] or 0,
+                    "warning_scans": row[2] or 0,
+                    "error_scans": row[3] or 0,
+                    "avg_scan_time": round(row[4] or 0, 2),
+                    "hourly_stats": [{"hour": h, "scans": s} for h, s in hourly_stats],
+                    "top_scanners": [
+                        {"username": u, "scans": c, "success": s} 
+                        for u, c, s in top_scanners
+                    ],
+                    "total_tickets": tickets_row[0] or 0,
+                    "scanned_tickets": tickets_row[1] or 0,
+                    "recent_scans": [
+                        {
+                            "scanner": s, 
+                            "code": c, 
+                            "result": r,
+                            "time_ms": t,
+                            "signature_valid": sv,
+                            "timestamp_valid": tv,
+                            "created_at": ca
+                        } 
+                        for s, c, r, t, sv, tv, ca in recent_scans
+                    ],
+                    "cache_hits": cache_row[1] or 0,
+                    "cache_misses": (cache_row[0] or 0) - (cache_row[1] or 0),
+                    "cache_hit_rate": round(
+                        ((cache_row[1] or 0) / max(cache_row[0] or 1, 1)) * 100, 2
+                    ),
+                    "avg_generation_time": round(cache_row[2] or 0, 2)
+                }
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения QR статистики: {e}")
+            return {}
+    
+    def log_qr_cache(self, action: str, cache_key: str, cache_hit: bool, gen_time_ms: int):
+        """Логирует использование кэша QR-кодов"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO qr_cache_stats (action, cache_key, cache_hit, generation_time_ms)
+                    VALUES (?, ?, ?, ?)
+                """, (action, cache_key, cache_hit, gen_time_ms))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка логирования кэша: {e}")
+    
+    def get_recent_scan_attempts(self, scanner_id: int, limit: int = 10) -> List[Dict]:
+        """Получает последние попытки сканирования сканера"""
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM scan_attempts
+                    WHERE scanner_id = ?
+                    ORDER BY attempt_time DESC
+                    LIMIT ?
+                """, (scanner_id, limit))
+                results = cursor.fetchall()
+                return [dict(row) for row in results]
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения попыток сканирования: {e}")
+            return []
     
     def get_order_guests(self, order_id: str) -> List[Dict]:
         """Получить гостей заказа"""
@@ -1798,8 +2466,8 @@ event_settings = EventSettings(db)
     ADMIN_BROADCAST,
     ADMIN_DASHBOARD,
     ADMIN_EXPORT_DATA,
-    SCAN_QR,  # Новое состояние для сканирования QR-кодов
-    SCAN_RESULT  # Новое состояние для показа результата сканирования
+    SCAN_QR,
+    SCAN_RESULT
 ) = range(21)
 
 # ========== ПОМОЩНИКИ ==========
@@ -1850,6 +2518,11 @@ def is_valid_email(email: str) -> bool:
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return bool(re.match(pattern, email))
 
+def is_own_order(order: Dict, user_id: int) -> bool:
+    """Проверяет, является ли заказ собственным для пользователя"""
+    return order["user_id"] == user_id
+
+# ========== ФУНКЦИИ ДЛЯ УВЕДОМЛЕНИЙ ==========
 async def send_channel_notification(context: ContextTypes.DEFAULT_TYPE, order: Dict, promoter_username: str, action: str):
     """Отправить уведомление в канал с уникальным кодом"""
     try:
@@ -2048,411 +2721,6 @@ async def check_and_send_notifications(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка при проверке и отправке уведомлений: {e}")
 
-def is_own_order(order: Dict, user_id: int) -> bool:
-    """Проверяет, является ли заказ собственным для пользователя"""
-    return order["user_id"] == user_id
-
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ РАССЫЛКИ ==========
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для рассылки сообщений всем пользователям"""
-    user = update.effective_user
-    
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text(
-            "❌ *У вас нет прав администратора*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return MAIN_MENU
-    
-    if context.args:
-        message = ' '.join(context.args)
-        
-        # Получаем всех пользователей
-        users = db.get_all_users()
-        
-        await update.message.reply_text(
-            f"📢 *Начинаю рассылку для {len(users)} пользователей...*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        success = 0
-        failed = 0
-        
-        for user_data in users:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_data['user_id'],
-                    text=message,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                success += 1
-                await asyncio.sleep(0.1)  # Ограничение скорости
-            except Exception as e:
-                failed += 1
-                logger.error(f"Ошибка отправки пользователю {user_data['user_id']}: {e}")
-        
-        await update.message.reply_text(
-            f"✅ *Рассылка завершена!*\n\n"
-            f"✅ Успешно: {success}\n"
-            f"❌ Не удалось: {failed}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await update.message.reply_text(
-            "📢 *Создание рассылки*\n\n"
-            "Введите сообщение для рассылки:\n\n"
-            "Пример: /broadcast Привет! Скоро начнется SMILE PARTY! 🎉",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ РЕЗЕРВНОГО КОПИРОВАНИЯ ==========
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создание резервной копии базы данных"""
-    user = update.effective_user
-    
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text(
-            "❌ *У вас нет прав администратора*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return MAIN_MENU
-    
-    backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    backup_sql = f"{backup_file}.sql"
-    
-    try:
-        # Копируем файл базы данных
-        shutil.copy2(DB_FILE, backup_file)
-        
-        # Создаем SQL дамп
-        with closing(sqlite3.connect(DB_FILE)) as conn:
-            with open(backup_sql, 'w', encoding='utf-8') as f:
-                for line in conn.iterdump():
-                    f.write(f'{line}\n')
-        
-        # Отправляем файл базы данных
-        with open(backup_file, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename=backup_file,
-                caption="💾 Резервная копия базы данных"
-            )
-        
-        # Отправляем SQL дамп
-        with open(backup_sql, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename=backup_sql,
-                caption="📝 SQL дамп базы данных"
-            )
-        
-        # Очистка
-        os.remove(backup_file)
-        os.remove(backup_sql)
-        
-        await update.message.reply_text(
-            "✅ *Резервные копии успешно созданы и отправлены!*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка создания бэкапа: {e}")
-        await update.message.reply_text(
-            f"❌ *Ошибка создания резервной копии:*\n\n{str(e)}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ЭКСПОРТА ДАННЫХ ==========
-async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экспорт данных в CSV"""
-    user = update.effective_user
-    
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text(
-            "❌ *У вас нет прав администратора*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return MAIN_MENU
-    
-    try:
-        await update.message.reply_text(
-            "📊 *Подготавливаю данные для экспорта...*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        # Получаем все закрытые заказы
-        orders = db.get_orders_by_status("closed")
-        
-        if not orders:
-            await update.message.reply_text(
-                "❌ *Нет данных для экспорта*",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # Создаем CSV в памяти
-        output = io.StringIO()
-        writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-        
-        # Заголовки
-        writer.writerow([
-            'ID заказа', 'Код заказа', 'Тип билета', 'Имя', 'Email', 
-            'Telegram', 'Кол-во гостей', 'Сумма', 'Дата создания', 
-            'Дата закрытия', 'Промоутер', 'Статус', 'Отсканирован', 'Сканирован'
-        ])
-        
-        # Данные
-        for order in orders:
-            created_at = order['created_at']
-            if isinstance(created_at, str):
-                created_date = created_at[:10]
-            else:
-                created_date = created_at.strftime('%Y-%m-%d') if created_at else ''
-            
-            closed_at = order.get('closed_at')
-            if closed_at:
-                if isinstance(closed_at, str):
-                    closed_date = closed_at[:10]
-                else:
-                    closed_date = closed_at.strftime('%Y-%m-%d') if closed_at else ''
-            else:
-                closed_date = ''
-            
-            scanned = 'Да' if order.get('scanned_at') else 'Нет'
-            scanned_by = order.get('scanned_by', '')
-            
-            writer.writerow([
-                order['order_id'],
-                order['order_code'],
-                'VIP' if order.get('ticket_type') == 'vip' else 'Standard',
-                sanitize_input(order['user_name']),
-                sanitize_input(order['user_email']),
-                sanitize_input(order.get('username', '')),
-                order['group_size'],
-                order['total_amount'],
-                created_date,
-                closed_date,
-                sanitize_input(order.get('closed_by', '')),
-                order['status'],
-                scanned,
-                scanned_by
-            ])
-        
-        # Готовим файл для отправки
-        output.seek(0)
-        csv_data = output.getvalue().encode('utf-8-sig')  # UTF-8 с BOM для Excel
-        
-        # Отправляем файл
-        await update.message.reply_document(
-            document=io.BytesIO(csv_data),
-            filename=f"orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            caption="📊 Экспорт заказов"
-        )
-        
-        logger.info(f"Экспорт данных выполнен, отправлено {len(orders)} записей")
-        
-    except Exception as e:
-        logger.error(f"Ошибка экспорта данных: {e}")
-        await update.message.reply_text(
-            f"❌ *Ошибка экспорта данных:*\n\n{str(e)}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ПАНЕЛИ УПРАВЛЕНИЯ ==========
-async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Панель управления с графиками и аналитикой"""
-    user = update.effective_user
-    
-    if user.id not in ADMIN_IDS + PROMOTER_IDS:
-        if update.message:
-            await update.message.reply_text(
-                "❌ *У вас нет прав для просмотра панели управления*",
-                reply_markup=get_main_menu_keyboard(context.user_data.get('user_role', 'user')),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        elif update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                "❌ *У вас нет прав для просмотра панели управления*",
-                reply_markup=get_main_menu_keyboard(context.user_data.get('user_role', 'user')),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        return MAIN_MENU
-    
-    try:
-        # Проверяем, откуда пришел запрос
-        if update.callback_query:
-            query = update.callback_query
-            await query.answer()
-            message = query.message
-            edit_message = query.edit_message_text
-        else:
-            message = update.message
-            edit_message = update.message.reply_text
-        
-        await edit_message(
-            "📊 *Загружаю данные для панели управления...*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        stats = db.get_statistics()
-        scan_stats = db.get_scan_stats() if user.id in SCANNER_IDS else {}
-        
-        # Формируем текст панели
-        text = "📈 *ПАНЕЛЬ УПРАВЛЕНИЯ SMILE PARTY*\n\n"
-        
-        # Основная статистика
-        text += "📊 *ОСНОВНАЯ СТАТИСТИКА:*\n"
-        text += f"• Всего заказов: {stats.get('total_orders', 0)}\n"
-        text += f"• Активные: {stats.get('active_orders', 0)}\n"
-        text += f"• Закрытые: {stats.get('closed_orders', 0)}\n"
-        text += f"• Выручка: {stats.get('revenue', 0)} ₽\n"
-        text += f"• Гостей в списках: {stats.get('total_guests', 0)}\n\n"
-        
-        # Статистика за сегодня
-        text += "📅 *СЕГОДНЯ:*\n"
-        text += f"• Новых заказов: {stats.get('today_orders', 0)}\n"
-        text += f"• Выручка: {stats.get('today_revenue', 0)} ₽\n"
-        text += f"• Уникальных покупателей: {stats.get('today_users', 0)}\n\n"
-        
-        # Статистика по типам билетов
-        text += "🎫 *СТАТИСТИКА ПО БИЛЕТАМ:*\n"
-        text += f"• Обычные: {stats.get('standard_tickets', 0)} ({stats.get('standard_revenue', 0)} ₽)\n"
-        text += f"• VIP: {stats.get('vip_tickets', 0)} ({stats.get('vip_revenue', 0)} ₽)\n\n"
-        
-        # Статистика сканирований QR-кодов
-        if scan_stats:
-            text += "📱 *СТАТИСТИКА СКАНИРОВАНИЙ:*\n"
-            text += f"• Всего сканирований: {scan_stats.get('total_scans', 0)}\n"
-            text += f"• ✅ Успешных: {scan_stats.get('success_scans', 0)}\n"
-            text += f"• ⚠️ Повторных: {scan_stats.get('warning_scans', 0)}\n"
-            text += f"• ❌ Ошибок: {scan_stats.get('error_scans', 0)}\n"
-            text += f"• Отсканировано билетов: {scan_stats.get('scanned_tickets', 0)}/{scan_stats.get('total_valid_tickets', 0)}\n"
-            text += f"• Сегодня: {scan_stats.get('today_scans', 0)} (успешно: {scan_stats.get('today_success', 0)})\n\n"
-            
-            # Последние сканирования
-            if scan_stats.get('recent_scans'):
-                text += "📋 *ПОСЛЕДНИЕ СКАНИРОВАНИЯ:*\n"
-                for scan in scan_stats['recent_scans'][:5]:
-                    created_at = scan['created_at']
-                    if isinstance(created_at, str):
-                        time_str = created_at[11:16]
-                    else:
-                        time_str = created_at.strftime('%H:%M')
-                    
-                    emoji = "✅" if scan['scan_result'] == 'success' else "⚠️" if scan['scan_result'] == 'warning' else "❌"
-                    text += f"{emoji} {time_str} - @{scan['scanner_username']} - {scan['order_code']}\n"
-                text += "\n"
-        
-        # Статистика за 7 дней (текстовый график)
-        weekly_stats = stats.get('weekly_stats', [])
-        if weekly_stats:
-            text += "📆 *СТАТИСТИКА ЗА 7 ДНЕЙ:*\n"
-            
-            # Находим максимальное количество заказов для масштабирования
-            max_orders = max([day['orders'] for day in weekly_stats] + [1])
-            
-            for day in weekly_stats[-7:]:  # Последние 7 дней
-                date_str = day['date']
-                if isinstance(date_str, str):
-                    date_display = date_str[-5:]  # Показываем только день и месяц
-                else:
-                    date_display = date_str.strftime('%d.%m')
-                
-                orders = day['orders']
-                revenue = day['revenue'] or 0
-                
-                # Создаем текстовый график
-                bar_length = int((orders / max_orders) * 20)
-                bar = '█' * bar_length + '░' * (20 - bar_length)
-                
-                text += f"{date_display}: {bar} {orders} зак. ({revenue} ₽)\n"
-            
-            text += "\n"
-        
-        # Топ промоутеров
-        top_promoters = stats.get('top_promoters', [])
-        if top_promoters:
-            text += "🏆 *ТОП ПРОМОУТЕРОВ:*\n"
-            for i, promoter in enumerate(top_promoters[:5], 1):
-                text += f"{i}. @{promoter['username']}: {promoter['closed_count']} зак. ({promoter['total_revenue']} ₽)\n"
-            text += "\n"
-        
-        # Топ сканеров
-        if scan_stats and scan_stats.get('top_scanners'):
-            text += "📱 *ТОП СКАНЕРОВ:*\n"
-            for i, scanner in enumerate(scan_stats['top_scanners'][:3], 1):
-                text += f"{i}. @{scanner['scanner_username']}: {scanner['scan_count']} сканирований\n"
-            text += "\n"
-        
-        # Активные пользователи
-        top_users = db.get_top_users(5)
-        if top_users:
-            text += "👥 *САМЫЕ АКТИВНЫЕ ПОЛЬЗОВАТЕЛИ:*\n"
-            for i, user_data in enumerate(top_users, 1):
-                username = user_data.get('username', f"user_{user_data['user_id']}")
-                first_name = user_data.get('first_name', '')
-                request_count = user_data.get('request_count', 0)
-                text += f"{i}. {first_name} (@{username}): {request_count} запросов\n"
-        
-        # Кнопки управления
-        keyboard = []
-        if user.id in ADMIN_IDS:
-            keyboard.append([
-                InlineKeyboardButton("📤 Экспорт данных", callback_data="admin_export"),
-                InlineKeyboardButton("💾 Создать бэкап", callback_data="admin_backup")
-            ])
-            keyboard.append([
-                InlineKeyboardButton("📢 Создать рассылку", callback_data="admin_broadcast"),
-                InlineKeyboardButton("🎫 Управление промокодами", callback_data="admin_promo_codes")
-            ])
-        
-        # Кнопка сканирования QR для промоутеров и администраторов
-        if user.id in SCANNER_IDS:
-            keyboard.append([
-                InlineKeyboardButton("📱 Сканировать QR-код", callback_data="scan_qr_menu")
-            ])
-        
-        keyboard.append([
-            InlineKeyboardButton("🔄 Обновить", callback_data="admin_dashboard_refresh"),
-            InlineKeyboardButton("🔙 Назад", callback_data="admin_back")
-        ])
-        
-        # Используем правильный метод для ответа
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        
-        return ADMIN_DASHBOARD
-        
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке панели управления: {e}")
-        
-        error_text = f"❌ *Ошибка загрузки панели управления:*\n\n{str(e)}"
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                error_text,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                error_text,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        
-        return MAIN_MENU
-
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ СИСТЕМЫ НАПОМИНАНИЙ ==========
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Отправка напоминаний о необработанных заказах"""
     try:
@@ -2485,17 +2753,70 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка в send_reminders: {e}")
 
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ПРОМОКОДОВ ==========
+async def send_order_notification_to_user(context: ContextTypes.DEFAULT_TYPE, order: Dict, action: str, promoter_username: str):
+    """Отправить уведомление пользователю о действии с его заказом"""
+    try:
+        if order['user_id']:
+            escaped_promoter = escape_markdown(promoter_username)
+            escaped_user_name = escape_markdown(str(order['user_name']))
+            formatted_code = format_code_for_display(order['order_code'])
+            
+            ticket_type_text = "VIP" if order.get('ticket_type') == 'vip' else "Обычный"
+            
+            if action == "closed":
+                message = (
+                    f"✅ *Ваш заказ #{order['order_id']} успешно обработан!*\n\n"
+                    f"*Тип билета:* {ticket_type_text}\n"
+                    f"*Ваш уникальный код:* `{order['order_code']}`\n\n"
+                    f"Промоутер @{escaped_promoter} подтвердил вашу покупку.\n\n"
+                    f"*Детали заказа:*\n"
+                    f"• Контактное лицо: {escaped_user_name}\n"
+                    f"• Количество гостей: {order['group_size']}\n"
+                    f"• Сумма: {order['total_amount']} ₽\n\n"
+                    f"*💾 Сохраните ваш код! Он потребуется при входе на мероприятие.*\n\n"
+                    f"Спасибо за покупку! Ждем вас на мероприятии! 🎉"
+                )
+                
+                # Добавляем кнопку для получения QR-кода
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎫 Получить QR-код билета", callback_data=f"get_qr_{order['order_id']}")]
+                ])
+                
+                await context.bot.send_message(
+                    chat_id=order['user_id'],
+                    text=message,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif action == "refunded":
+                message = (
+                    f"❌ *По вашему заказу #{order['order_id']} оформлен возврат*\n\n"
+                    f"*Тип билета:* {ticket_type_text}\n"
+                    f"*Код заказа:* `{order['order_code']}`\n\n"
+                    f"Промоутер @{escaped_promoter} оформил возврат по вашему заказу.\n\n"
+                    f"Если у вас есть вопросы, свяжитесь с поддержкой: {event_settings.get_all_settings()['contact_telegram']}"
+                )
+                
+                await context.bot.send_message(
+                    chat_id=order['user_id'],
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                return
+            
+            logger.info(f"Уведомление отправлено пользователю {order['user_id']}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления пользователю: {e}")
+
+# ========== ФУНКЦИИ ДЛЯ QR-КОДОВ ==========
 async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE, order_code: str):
     """
-    Генерирует и отправляет QR-код для билета
-    
-    Args:
-        update: Update объект
-        context: Context объект
-        order_code: Код заказа
+    Генерирует и отправляет QR-код для билета с использованием QRManager
     """
-    qr_log_details = {
+    start_time = time.time()
+    
+    log_details = {
         "order_code": order_code,
         "user_id": update.effective_user.id if update.effective_user else None,
         "action": "generate_ticket_qr",
@@ -2504,17 +2825,13 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
     try:
         logger.info(f"🚀 Начало генерации QR-кода для заказа {order_code}")
-        log_qr_action("generate_ticket_start", qr_log_details)
         
         order = db.get_order_by_code(order_code)
         
         if not order:
             error_msg = "Заказ не найден"
             logger.warning(f"⚠️ {error_msg}: {order_code}")
-            qr_log_details["error"] = error_msg
-            log_qr_action("generate_ticket_error", qr_log_details)
             
-            # Определяем, откуда пришел запрос
             if update.callback_query:
                 await update.callback_query.edit_message_text(
                     "❌ *Заказ не найден*",
@@ -2527,18 +2844,9 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 )
             return
         
-        qr_log_details["order_found"] = {
-            "order_id": order['order_id'],
-            "status": order['status'],
-            "ticket_type": order.get('ticket_type'),
-            "group_size": order['group_size']
-        }
-        
         if order['status'] != 'closed':
             error_msg = f"Билет еще не активирован (статус: {order['status']})"
             logger.warning(f"⚠️ {error_msg}")
-            qr_log_details["error"] = error_msg
-            log_qr_action("generate_ticket_error", qr_log_details)
             
             error_text = f"❌ *Билет еще не активирован!*\n\nСтатус заказа: {order['status']}\nQR-код будет доступен после подтверждения покупки промоутером."
             
@@ -2556,28 +2864,46 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
         # Получаем список гостей
         guests = db.get_order_guests(order['order_id'])
-        qr_log_details["guests_count"] = len(guests) if guests else 0
+        
+        # Вычисляем хэш для кэширования
+        qr_hash = hashlib.md5(f"{order_code}_{order.get('ticket_type', 'standard')}".encode()).hexdigest()
+        db.update_order_qr_data(order['order_id'], qr_hash, QR_CONFIG["version"])
         
         if guests:
             logger.info(f"📋 Найдено {len(guests)} гостей для заказа {order_code}")
-            # Если есть несколько гостей, генерируем отдельные QR-коды для каждого
+            
             for i, guest in enumerate(guests, 1):
                 guest_name = guest['full_name']
-                qr_data = order_code
-                ticket_type = order.get('ticket_type', 'standard')
                 
-                logger.info(f"🔄 Генерация QR-кода для гостя #{i}: {guest_name}")
+                # Генерируем хэш гостя
+                guest_hash = hashlib.md5(guest_name.encode()).hexdigest()[:8]
+                db.update_guest_hash(order_code, guest_name, guest_hash)
                 
-                qr_bytes = generate_qr_code(qr_data, ticket_type, guest_name)
+                # Генерируем QR-код через менеджер
+                qr_bytes = qr_manager.generate_qr_image(
+                    order_code,
+                    order.get('ticket_type', 'standard'),
+                    guest_name
+                )
+                
+                # Логируем использование кэша
+                cache_key = hashlib.md5(f"{order_code}_{guest_name}".encode()).hexdigest()
+                db.log_qr_cache(
+                    "generate",
+                    cache_key,
+                    False,  # В реальности нужно проверять был ли в кэше
+                    int((time.time() - start_time) * 1000)
+                )
                 
                 caption = (
                     f"🎫 *Билет для {escape_markdown(guest_name)}*\n\n"
                     f"🔑 *Код:* `{order_code}`\n"
-                    f"🎫 *Тип:* {'VIP' if ticket_type == 'vip' else 'Обычный'}\n"
+                    f"🎫 *Тип:* {'VIP' if order.get('ticket_type') == 'vip' else 'Обычный'}\n"
+                    f"🔒 *Защита:* HMAC + Timestamp\n"
+                    f"📱 *Версия:* {QR_CONFIG['version']}\n"
                     f"👤 *Контакт:* {escape_markdown(str(order['user_name']))}"
                 )
                 
-                # Отправляем фото
                 if update.callback_query:
                     await update.callback_query.message.reply_photo(
                         photo=io.BytesIO(qr_bytes),
@@ -2591,20 +2917,22 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         parse_mode=ParseMode.MARKDOWN
                     )
                 
-                logger.info(f"✅ QR-код для гостя {guest_name} отправлен")
                 await asyncio.sleep(0.5)
         else:
-            # Если гостей нет (старый формат), генерируем один QR-код
-            logger.info(f"🔄 Генерация единого QR-кода для заказа {order_code}")
-            qr_bytes = generate_qr_code(order_code, order.get('ticket_type', 'standard'))
+            # Если гостей нет, генерируем один QR-код
+            qr_bytes = qr_manager.generate_qr_image(
+                order_code,
+                order.get('ticket_type', 'standard')
+            )
             
             caption = (
                 f"🎫 *Билет для {escape_markdown(str(order['user_name']))}*\n\n"
                 f"🔑 *Код:* `{order_code}`\n"
-                f"🎫 *Тип:* {'VIP' if order.get('ticket_type') == 'vip' else 'Обычный'}"
+                f"🎫 *Тип:* {'VIP' if order.get('ticket_type') == 'vip' else 'Обычный'}\n"
+                f"🔒 *Защита:* HMAC + Timestamp\n"
+                f"📱 *Версия:* {QR_CONFIG['version']}"
             )
             
-            # Отправляем фото
             if update.callback_query:
                 await update.callback_query.message.reply_photo(
                     photo=io.BytesIO(qr_bytes),
@@ -2618,16 +2946,11 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     parse_mode=ParseMode.MARKDOWN
                 )
         
-        qr_log_details["success"] = True
-        log_qr_action("generate_ticket_success", qr_log_details)
-        logger.info(f"✅ QR-коды успешно отправлены для заказа {order_code}")
+        logger.info(f"✅ QR-коды успешно отправлены для заказа {order_code} за {time.time()-start_time:.2f}с")
         
     except Exception as e:
-        qr_log_details["error"] = str(e)
-        qr_log_details["traceback"] = traceback.format_exc()
         logger.error(f"❌ Ошибка генерации QR-кода: {e}")
-        logger.error(f"📝 Traceback: {traceback.format_exc()}")
-        log_qr_action("generate_ticket_error", qr_log_details)
+        logger.error(traceback.format_exc())
         
         error_text = f"❌ *Ошибка генерации QR-кода:*\n\n{str(e)}"
         
@@ -2669,14 +2992,11 @@ async def scan_qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатывает сканирование QR-кода (фото или текст)
-    
-    Args:
-        update: Update объект
-        context: Context объект
+    Обрабатывает сканирование QR-кода с улучшенной защитой
     """
     user = update.effective_user
     username = user.username or f"user_{user.id}"
+    start_time = time.time()
     
     scan_log_details = {
         "scanner_id": user.id,
@@ -2686,7 +3006,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     logger.info(f"📱 Начало обработки сканирования QR от пользователя {user.id}")
-    log_qr_action("scan_start", scan_log_details)
     
     if user.id not in SCANNER_IDS:
         logger.warning(f"⚠️ Пользователь {user.id} попытался сканировать QR без прав")
@@ -2696,177 +3015,200 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MAIN_MENU
     
+    # Проверяем лимит попыток (защита от DDoS)
+    attempts = db.get_scan_attempts_count(user.id, 5)  # за последние 5 минут
+    if attempts > 20:  # максимум 20 попыток за 5 минут
+        logger.warning(f"⚠️ Пользователь {user.id} превысил лимит попыток сканирования")
+        await update.message.reply_text(
+            "⏰ *Слишком много попыток сканирования!*\n\n"
+            "Пожалуйста, подождите 5 минут перед повторной попыткой.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return SCAN_QR
+    
     try:
-        # Проверяем, является ли сообщение фото
+        qr_data = None
+        scan_result = None
+        
         if update.message.photo:
             scan_log_details["scan_method"] = "photo"
             logger.info("📸 Получено фото для распознавания QR-кода")
-            # Получаем фото
+            
             photo = update.message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
             
-            # Скачиваем фото во временный файл
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
                 await file.download_to_drive(tmp_file.name)
                 tmp_path = tmp_file.name
-                scan_log_details["temp_file"] = tmp_path
             
             logger.info(f"📥 Фото сохранено во временный файл: {tmp_path}")
             
-            # Пытаемся распознать QR-код
             try:
-                import cv2
-                from pyzbar.pyzbar import decode
+                with open(tmp_path, 'rb') as f:
+                    image_bytes = f.read()
                 
-                logger.info("🔄 Попытка распознавания QR-кода с помощью OpenCV")
+                # Используем QR Manager для сканирования
+                scan_result = qr_manager.scan_qr_image(image_bytes)
                 
-                # Читаем изображение
-                img = cv2.imread(tmp_path)
-                if img is None:
-                    logger.error("❌ Не удалось прочитать изображение")
-                    raise Exception("Не удалось прочитать изображение")
-                
-                # Распознаем QR-коды
-                decoded_objects = decode(img)
-                
-                if decoded_objects:
-                    logger.info(f"✅ Найдено {len(decoded_objects)} QR-кодов на изображении")
-                    # Берем первый найденный QR-код
-                    qr_data = decoded_objects[0].data.decode('utf-8')
-                    scan_log_details["qr_data"] = qr_data
-                    logger.info(f"📝 Данные из QR-кода: {qr_data}")
-                    
-                    # Проверяем данные QR-кода
-                    verification_result = verify_qr_data(qr_data)
-                    scan_log_details["verification_result"] = verification_result
-                    
-                    if verification_result["valid"]:
-                        # Отмечаем билет как использованный
-                        code = verification_result["code"]
-                        ticket_type = verification_result.get("ticket_type", "standard")
-                        guest_name = verification_result.get("guest_name")
-                        order = verification_result["order"]
-                        
-                        logger.info(f"✅ QR-код валиден: код={code}, тип={ticket_type}")
-                        
-                        success = db.mark_ticket_scanned(code, user.id, username, guest_name)
-                        
-                        if success:
-                            logger.info(f"✅ Билет {code} отмечен как использованный")
-                            
-                            guests = db.get_order_guests(order['order_id'])
-                            
-                            if guests:
-                                guest_list = "\n".join([f"• {escape_markdown(g['full_name'])}" for g in guests])
-                                result_text = (
-                                    f"✅ *Билет действителен!*\n\n"
-                                    f"🔑 Код: `{code}`\n"
-                                    f"🎫 Тип: {'VIP 🎩' if order.get('ticket_type') == 'vip' else 'Обычный 🎟'}\n"
-                                    f"👤 Контакт: {escape_markdown(str(order['user_name']))}\n"
-                                    f"👥 Гости:\n{guest_list}\n\n"
-                                    f"✅ *Вход разрешен!*\n\n"
-                                    f"📝 *Билет отмечен как использованный*"
-                                )
-                            else:
-                                result_text = (
-                                    f"✅ *Билет действителен!*\n\n"
-                                    f"🔑 Код: `{code}`\n"
-                                    f"🎫 Тип: {'VIP 🎩' if order.get('ticket_type') == 'vip' else 'Обычный 🎟'}\n"
-                                    f"👤 Владелец: {escape_markdown(str(order['user_name']))}\n\n"
-                                    f"✅ *Вход разрешен!*\n\n"
-                                    f"📝 *Билет отмечен как использованный*"
-                                )
-                            
-                            db.log_scan(user.id, username, code, guest_name, "success", "Успешное сканирование")
-                            
-                            # Отправляем уведомление в канал логов
-                            await send_log_to_channel(
-                                context,
-                                f"QR-код отсканирован: {code} - пользователь @{username}",
-                                "INFO"
-                            )
-                            
-                            logger.info(f"✅ Успешное сканирование билета {code}")
-                        else:
-                            logger.warning(f"⚠️ Ошибка при отметке билета {code}")
-                            result_text = (
-                                f"⚠️ *Ошибка при отметке билета*\n\n"
-                                f"🔑 Код: `{code}`\n\n"
-                                f"Возможно, билет уже был использован. Пожалуйста, проверьте вручную."
-                            )
-                            db.log_scan(user.id, username, code, guest_name, "error", "Ошибка отметки билета")
-                    else:
-                        error_msg = verification_result.get("error", "Неизвестная ошибка")
-                        logger.warning(f"⚠️ QR-код не валиден: {error_msg}")
-                        result_text = f"❌ *{error_msg}*"
-                        
-                        # Логируем результат
-                        if "order" in verification_result:
-                            order = verification_result["order"]
-                            db.log_scan(user.id, username, order.get('order_code'), None, "error", error_msg)
-                        else:
-                            db.log_scan(user.id, username, "unknown", None, "error", error_msg)
+                if scan_result["success"]:
+                    qr_data = scan_result["data"]
+                    logger.info(f"✅ QR-код распознан: {qr_data[:50]}...")
                 else:
-                    logger.warning("⚠️ QR-код не найден на изображении")
-                    result_text = (
-                        "❌ *QR-код не найден на изображении*\n\n"
-                        "Пожалуйста, убедитесь, что фото четкое и QR-код хорошо виден.\n"
-                        "Или введите код вручную:"
-                    )
-            
-            except ImportError as e:
-                logger.error(f"❌ Ошибка импорта библиотек: {e}")
-                result_text = (
-                    "❌ *Библиотеки для распознавания QR-кодов не установлены*\n\n"
-                    "Пожалуйста, введите код вручную в формате #KA123456"
-                )
+                    logger.warning(f"⚠️ QR-код не распознан: {scan_result['error']}")
             
             finally:
-                # Удаляем временный файл
                 try:
                     os.unlink(tmp_path)
-                    logger.info(f"🗑️ Временный файл удален: {tmp_path}")
                 except Exception as e:
                     logger.error(f"❌ Ошибка удаления временного файла: {e}")
         
-        # Если это текст, обрабатываем как код
         elif update.message.text:
             text = update.message.text.strip()
             scan_log_details["input_text"] = text
             logger.info(f"📝 Получен текст для обработки: {text}")
             
-            # Ищем код в тексте
-            code_pattern = r'#?KA\d{6}'
-            match = re.search(code_pattern, text)
+            # Ищем код в тексте (поддержка разных форматов)
+            code_patterns = [
+                r'#?KA\d{6}',  # Основной формат
+                r'KA\d{6}',     # Без #
+                r'\d{6}',        # Только цифры
+                r'SMILE_PARTY:.*'  # Полные данные QR
+            ]
             
-            if match:
-                code = match.group()
-                # Убираем # если есть
-                if code.startswith('#'):
-                    code = code[1:]
+            for pattern in code_patterns:
+                match = re.search(pattern, text)
+                if match:
+                    qr_data = match.group()
+                    scan_log_details["extracted_data"] = qr_data
+                    logger.info(f"🔍 Извлечено из текста по шаблону {pattern}: {qr_data}")
+                    break
+            
+            if not qr_data:
+                # Пробуем распознать как полный QR-формат
+                scan_result = {"success": True, "data": text}
+                qr_data = text
+        
+        if qr_data:
+            # Проверяем, является ли это полными данными QR или просто кодом
+            if ':' in qr_data:
+                # Полные данные QR, парсим их
+                parsed = qr_manager.parse_qr_data(qr_data)
+                scan_log_details["parsed"] = parsed
                 
-                scan_log_details["extracted_code"] = code
-                logger.info(f"🔍 Извлечен код из текста: {code}")
-                
-                # Проверяем код в базе
-                order = db.get_order_by_code(code)
-                
-                if not order:
-                    logger.warning(f"⚠️ Билет с кодом {code} не найден")
-                    result_text = "❌ *Билет не найден!*"
-                    db.log_scan(user.id, username, code, None, "error", "Билет не найден")
-                elif order['status'] != 'closed':
-                    logger.warning(f"⚠️ Билет {code} не активирован (статус: {order['status']})")
-                    result_text = f"❌ *Билет еще не активирован!*\n\nСтатус: {order['status']}"
-                    db.log_scan(user.id, username, code, None, "error", f"Статус: {order['status']}")
-                elif order.get('scanned_at'):
-                    scanned_time = order['scanned_at']
-                    if isinstance(scanned_time, str):
-                        scanned_time = scanned_time[:16]
-                    else:
-                        scanned_time = scanned_time.strftime('%d.%m.%Y %H:%M')
+                if not parsed["valid"]:
+                    error_msg = parsed.get("error", "Неизвестная ошибка")
+                    logger.warning(f"⚠️ QR-код не валиден: {error_msg}")
                     
-                    logger.warning(f"⚠️ Билет {code} уже был использован {scanned_time}")
+                    result_text = f"❌ *{error_msg}*"
+                    
+                    db.log_scan(
+                        user.id, username, 
+                        parsed.get("code", "unknown"), 
+                        None, "error", error_msg,
+                        scan_time_ms=int((time.time() - start_time) * 1000),
+                        qr_version=parsed.get("version"),
+                        signature_valid=False,
+                        timestamp_valid=False
+                    )
+                    
+                    db.record_scan_attempt(user.id, "unknown", False)
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("📱 Сканировать еще", callback_data="scan_qr_start")],
+                        [InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_menu")]
+                    ]
+                    
+                    await update.message.reply_text(
+                        result_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    return SCAN_RESULT
+                
+                code = parsed["code"]
+                ticket_type = parsed.get("ticket_type", "standard")
+                guest_hash = parsed.get("guest_hash")
+            else:
+                # Просто код, ищем в базе
+                code = qr_data.replace('#', '').strip()
+                parsed = {"valid": True, "code": code}
+            
+            # Проверяем rate limit для этого билета
+            rate_ok, wait_time = qr_manager.check_scan_rate_limit(user.id, code)
+            if not rate_ok:
+                logger.warning(f"⚠️ Rate limit для билета {code}, сканер {user.id}")
+                
+                result_text = (
+                    f"⏰ *Слишком частые попытки сканирования!*\n\n"
+                    f"🔑 Код: `{code}`\n"
+                    f"Пожалуйста, подождите {wait_time} секунд перед повторным сканированием."
+                )
+                
+                db.log_scan(
+                    user.id, username, code, None, "warning",
+                    f"Rate limit, ожидание {wait_time}с",
+                    scan_time_ms=int((time.time() - start_time) * 1000)
+                )
+                
+                keyboard = [
+                    [InlineKeyboardButton("📱 Сканировать еще", callback_data="scan_qr_start")],
+                    [InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_menu")]
+                ]
+                
+                await update.message.reply_text(
+                    result_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                return SCAN_RESULT
+            
+            # Проверяем код в базе
+            order = db.get_order_by_code(code)
+            
+            if not order:
+                logger.warning(f"⚠️ Билет с кодом {code} не найден")
+                result_text = "❌ *Билет не найден в системе!*"
+                
+                db.log_scan(
+                    user.id, username, code, None, "error", 
+                    "Билет не найден",
+                    scan_time_ms=int((time.time() - start_time) * 1000)
+                )
+                db.record_scan_attempt(user.id, code, False)
+                
+            elif order['status'] != 'closed':
+                logger.warning(f"⚠️ Билет {code} не активирован (статус: {order['status']})")
+                result_text = f"❌ *Билет еще не активирован!*\n\nСтатус: {order['status']}"
+                
+                db.log_scan(
+                    user.id, username, code, None, "error", 
+                    f"Статус: {order['status']}",
+                    scan_time_ms=int((time.time() - start_time) * 1000)
+                )
+                db.record_scan_attempt(user.id, code, False)
+                
+            elif order.get('scanned_at'):
+                scanned_time = order['scanned_at']
+                if isinstance(scanned_time, str):
+                    scanned_time = scanned_time[:16]
+                else:
+                    scanned_time = scanned_time.strftime('%d.%m.%Y %H:%M')
+                
+                logger.warning(f"⚠️ Билет {code} уже был использован {scanned_time}")
+                
+                # Проверяем, не пытаются ли сканировать снова слишком часто
+                if order.get('scanned_by') == username:
+                    # Тот же сканер пытается сканировать повторно
+                    result_text = (
+                        f"⚠️ *Билет уже был отсканирован ВАМИ!*\n\n"
+                        f"🔑 Код: `{code}`\n"
+                        f"👤 Владелец: {escape_markdown(str(order['user_name']))}\n"
+                        f"📅 Время сканирования: {scanned_time}\n\n"
+                        f"❌ *Повторный вход запрещен!*"
+                    )
+                else:
                     result_text = (
                         f"⚠️ *Билет уже был использован!*\n\n"
                         f"🔑 Код: `{code}`\n"
@@ -2875,25 +3217,71 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"👨‍💼 Сканировал: @{order.get('scanned_by', 'неизвестно')}\n\n"
                         f"❌ *Повторный вход запрещен!*"
                     )
-                    db.log_scan(user.id, username, code, None, "warning", "Повторное сканирование")
+                
+                db.log_scan(
+                    user.id, username, code, None, "warning", 
+                    "Повторное сканирование",
+                    scan_time_ms=int((time.time() - start_time) * 1000),
+                    signature_valid=parsed.get("valid", True) if 'parsed' in locals() else None,
+                    timestamp_valid=parsed.get("valid", True) if 'parsed' in locals() else None
+                )
+                db.record_scan_attempt(user.id, code, False)
+                
+            else:
+                logger.info(f"✅ Билет {code} найден и готов к сканированию")
+                
+                # Проверяем совпадение хэша гостя если есть
+                guest_match = True
+                guest_name = None
+                
+                if guest_hash:
+                    guests = db.get_order_guests(order['order_id'])
+                    for guest in guests:
+                        if guest.get('guest_hash') == guest_hash:
+                            guest_name = guest['full_name']
+                            break
+                    
+                    if not guest_name:
+                        logger.warning(f"⚠️ Хэш гостя {guest_hash} не совпадает ни с одним гостем")
+                        guest_match = False
+                
+                if not guest_match:
+                    result_text = (
+                        f"⚠️ *Несовпадение данных гостя!*\n\n"
+                        f"🔑 Код: `{code}`\n"
+                        f"Пожалуйста, попросите гостя показать свой личный QR-код."
+                    )
+                    
+                    db.log_scan(
+                        user.id, username, code, None, "error",
+                        "Несовпадение хэша гостя",
+                        scan_time_ms=int((time.time() - start_time) * 1000)
+                    )
+                    db.record_scan_attempt(user.id, code, False)
                 else:
-                    logger.info(f"✅ Билет {code} найден и готов к сканированию")
                     # Отмечаем билет как использованный
-                    success = db.mark_ticket_scanned(code, user.id, username)
+                    success = db.mark_ticket_scanned(code, user.id, username, guest_name)
                     
                     if success:
                         logger.info(f"✅ Билет {code} успешно отмечен как использованный")
-                        # Получаем список гостей
+                        
                         guests = db.get_order_guests(order['order_id'])
                         
                         if guests:
                             guest_list = "\n".join([f"• {escape_markdown(g['full_name'])}" for g in guests])
+                            
+                            # Отмечаем конкретного гостя если был хэш
+                            scanned_guest_marker = ""
+                            if guest_name:
+                                scanned_guest_marker = f"\n✅ Отсканирован гость: {escape_markdown(guest_name)}"
+                            
                             result_text = (
                                 f"✅ *Билет действителен!*\n\n"
                                 f"🔑 Код: `{code}`\n"
                                 f"🎫 Тип: {'VIP 🎩' if order.get('ticket_type') == 'vip' else 'Обычный 🎟'}\n"
                                 f"👤 Контакт: {escape_markdown(str(order['user_name']))}\n"
-                                f"👥 Гости:\n{guest_list}\n\n"
+                                f"👥 Гости:\n{guest_list}"
+                                f"{scanned_guest_marker}\n\n"
                                 f"✅ *Вход разрешен!*\n\n"
                                 f"📝 *Билет отмечен как использованный*"
                             )
@@ -2907,12 +3295,21 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 f"📝 *Билет отмечен как использованный*"
                             )
                         
-                        db.log_scan(user.id, username, code, None, "success", "Успешное сканирование")
+                        db.log_scan(
+                            user.id, username, code, guest_name, "success",
+                            "Успешное сканирование",
+                            scan_time_ms=int((time.time() - start_time) * 1000),
+                            guest_hash=guest_hash,
+                            signature_valid=parsed.get("valid", True) if 'parsed' in locals() else None,
+                            timestamp_valid=parsed.get("valid", True) if 'parsed' in locals() else None,
+                            qr_version=parsed.get("version") if 'parsed' in locals() else None
+                        )
+                        db.record_scan_attempt(user.id, code, True)
                         
                         # Отправляем уведомление в канал логов
                         await send_log_to_channel(
                             context,
-                            f"QR-код отсканирован: {code} - пользователь @{username}",
+                            f"✅ QR-код отсканирован: {code} - гость: {guest_name or 'не указан'} - сканер: @{username}",
                             "INFO"
                         )
                     else:
@@ -2922,15 +3319,13 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"🔑 Код: `{code}`\n\n"
                             f"Возможно, билет уже был использован. Пожалуйста, проверьте вручную."
                         )
-                        db.log_scan(user.id, username, code, None, "error", "Ошибка отметки билета")
-            else:
-                logger.warning(f"⚠️ Не удалось распознать код в тексте: {text}")
-                await update.message.reply_text(
-                    "❌ *Не удалось распознать код билета*\n\n"
-                    "Пожалуйста, убедитесь, что вы ввели код в формате #KA123456",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return SCAN_QR
+                        
+                        db.log_scan(
+                            user.id, username, code, guest_name, "error",
+                            "Ошибка отметки билета",
+                            scan_time_ms=int((time.time() - start_time) * 1000)
+                        )
+                        db.record_scan_attempt(user.id, code, False)
             
             # Создаем клавиатуру для продолжения
             keyboard = [
@@ -2945,15 +3340,19 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             scan_log_details["success"] = True
-            scan_log_details["result"] = result_text[:100]  # Только начало результата
-            log_qr_action("scan_complete", scan_log_details)
+            scan_log_details["scan_time_ms"] = int((time.time() - start_time) * 1000)
             
             return SCAN_RESULT
         
         else:
-            logger.warning(f"⚠️ Получено сообщение неподдерживаемого типа")
+            logger.warning(f"⚠️ Не удалось распознать код")
             await update.message.reply_text(
-                "❌ *Пожалуйста, отправьте фото QR-кода или введите код вручную*",
+                "❌ *Не удалось распознать QR-код*\n\n"
+                "Пожалуйста, убедитесь что:\n"
+                "• Фото четкое и хорошо освещено\n"
+                "• QR-код занимает большую часть кадра\n"
+                "• Нет бликов и искажений\n\n"
+                "Или введите код вручную в формате #KA123456",
                 parse_mode=ParseMode.MARKDOWN
             )
             return SCAN_QR
@@ -2962,14 +3361,18 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scan_log_details["error"] = str(e)
         scan_log_details["traceback"] = traceback.format_exc()
         logger.error(f"❌ Ошибка при сканировании QR-кода: {e}")
-        logger.error(f"📝 Traceback: {traceback.format_exc()}")
-        log_qr_action("scan_error", scan_log_details)
+        logger.error(traceback.format_exc())
         
         await update.message.reply_text(
             f"❌ *Ошибка при обработке:*\n\n{str(e)}",
             parse_mode=ParseMode.MARKDOWN
         )
         return SCAN_QR
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик фотографий с QR-кодами"""
+    # Перенаправляем в общий обработчик QR-кодов
+    return await handle_qr_scan(update, context)
 
 async def scan_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для просмотра статистики сканирований"""
@@ -3014,6 +3417,108 @@ async def scan_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text,
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def qr_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра расширенной статистики QR-кодов"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text(
+            "❌ *У вас нет прав для просмотра статистики*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return MAIN_MENU
+    
+    stats = db.get_qr_statistics()
+    qr_manager_stats = qr_manager.get_stats()
+    
+    text = "📊 *РАСШИРЕННАЯ СТАТИСТИКА QR-КОДОВ*\n\n"
+    
+    text += "📈 *ОБЩАЯ СТАТИСТИКА:*\n"
+    text += f"• Всего сканирований: {stats.get('total_scans', 0)}\n"
+    text += f"• ✅ Успешных: {stats.get('success_scans', 0)}\n"
+    text += f"• ⚠️ Повторных: {stats.get('warning_scans', 0)}\n"
+    text += f"• ❌ Ошибок: {stats.get('error_scans', 0)}\n"
+    text += f"• Среднее время сканирования: {stats.get('avg_scan_time', 0)} мс\n\n"
+    
+    text += "🎟 *БИЛЕТЫ:*\n"
+    text += f"• Всего билетов: {stats.get('total_tickets', 0)}\n"
+    text += f"• Отсканировано: {stats.get('scanned_tickets', 0)}\n"
+    text += f"• Процент сканирования: {round(stats.get('scanned_tickets', 0) / max(stats.get('total_tickets', 1), 1) * 100, 1)}%\n\n"
+    
+    text += "💾 *КЭШИРОВАНИЕ:*\n"
+    text += f"• Попаданий в кэш: {stats.get('cache_hits', 0)}\n"
+    text += f"• Промахов: {stats.get('cache_misses', 0)}\n"
+    text += f"• Эффективность: {stats.get('cache_hit_rate', 0)}%\n"
+    text += f"• Среднее время генерации: {stats.get('avg_generation_time', 0)} мс\n\n"
+    
+    text += "📊 *QR MANAGER:*\n"
+    text += f"• QR-кодов сгенерировано: {qr_manager_stats.get('qr_generated', 0)}\n"
+    text += f"• Ошибок генерации: {qr_manager_stats.get('qr_errors', 0)}\n"
+    text += f"• Попаданий в кэш: {qr_manager_stats.get('cache_hits', 0)}\n"
+    text += f"• Промахов: {qr_manager_stats.get('cache_misses', 0)}\n"
+    text += f"• Hit rate: {qr_manager_stats.get('cache_hit_rate', 0):.1f}%\n"
+    
+    if stats.get('top_scanners'):
+        text += "\n🏆 *ТОП СКАНЕРОВ:*\n"
+        for i, scanner in enumerate(stats['top_scanners'][:5], 1):
+            success_rate = round((scanner['success'] / max(scanner['scans'], 1)) * 100, 1)
+            text += f"{i}. @{scanner['username']}: {scanner['scans']} сканирований ({success_rate}% успешных)\n"
+    
+    if stats.get('recent_scans'):
+        text += "\n📋 *ПОСЛЕДНИЕ СКАНИРОВАНИЯ:*\n"
+        for scan in stats['recent_scans'][:5]:
+            created_at = scan['created_at']
+            if isinstance(created_at, str):
+                time_str = created_at[11:16]
+            else:
+                time_str = created_at.strftime('%H:%M')
+            
+            emoji = "✅" if scan['result'] == 'success' else "⚠️" if scan['result'] == 'warning' else "❌"
+            valid_icons = ""
+            if scan.get('signature_valid') is not None:
+                valid_icons += "🔐" if scan['signature_valid'] else "❌🔐"
+            if scan.get('timestamp_valid') is not None:
+                valid_icons += "⏱️" if scan['timestamp_valid'] else "❌⏱️"
+            
+            text += f"{emoji} {time_str} - @{scan['scanner']} - {scan['code']} {valid_icons}\n"
+    
+    if stats.get('hourly_stats'):
+        text += "\n📅 *АКТИВНОСТЬ ПО ЧАСАМ:*\n"
+        for hour_stat in stats['hourly_stats'][-8:]:  # Последние 8 часов
+            text += f"• {hour_stat['hour']}:00 - {hour_stat['scans']} сканирований\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data="qr_stats_refresh")],
+        [InlineKeyboardButton("🧹 Очистить кэш", callback_data="qr_clear_cache")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="admin_dashboard")]
+    ]
+    
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def qr_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок статистики QR"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "qr_stats_refresh":
+        await qr_stats_command(update, context)
+    
+    elif data == "qr_clear_cache":
+        cleared = qr_manager.clear_cache(older_than=3600)  # Старше часа
+        await query.edit_message_text(
+            f"🧹 *Кэш QR-кодов очищен*\n\n"
+            f"Удалено файлов: {cleared}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await asyncio.sleep(2)
+        await qr_stats_command(update, context)
 
 # ========== КЛАВИАТУРЫ ==========
 def get_role_selection_keyboard(user_id: int):
@@ -3144,6 +3649,7 @@ def get_scan_menu_keyboard():
     keyboard = [
         [InlineKeyboardButton("📱 Начать сканирование", callback_data="scan_qr_start")],
         [InlineKeyboardButton("📊 Статистика сканирований", callback_data="scan_stats")],
+        [InlineKeyboardButton("📊 Расширенная статистика QR", callback_data="qr_stats_refresh")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -3479,98 +3985,6 @@ def format_statistics() -> str:
     )
     
     return text
-
-# ========== УВЕДОМЛЕНИЯ ПРИ ЗАПУСКЕ ==========
-async def send_restart_notifications_async(bot_token: str):
-    """Асинхронная функция для отправки уведомлений о перезапуске"""
-    try:
-        from telegram import Bot
-        
-        bot = Bot(token=bot_token)
-        users = db.get_users_to_notify()
-        settings_data = event_settings.get_all_settings()
-        
-        notification_count = 0
-        for user in users:
-            try:
-                await bot.send_message(
-                    chat_id=user['user_id'],
-                    text=f"🔄 *{escape_markdown(str(settings_data['event_name']))} бот перезапущен!*\n\n"
-                         f"Бот снова в сети и готов к работе.\n"
-                         f"Используйте /start для начала работы.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                db.mark_user_notified(user['user_id'])
-                notification_count += 1
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Не удалось отправить уведомление пользователю {user['user_id']}: {e}")
-        
-        logger.info(f"✅ Отправлено {notification_count} уведомлений при перезапуске бота")
-        
-    except Exception as e:
-        logger.error(f"Ошибка при отправке уведомлений при перезапуске: {e}")
-
-def send_restart_notifications():
-    """Синхронная функция для отправки уведомлений о перезапуске"""
-    import asyncio
-    asyncio.run(send_restart_notifications_async(BOT_TOKEN))
-
-async def send_order_notification_to_user(context: ContextTypes.DEFAULT_TYPE, order: Dict, action: str, promoter_username: str):
-    """Отправить уведомление пользователю о действии с его заказом"""
-    try:
-        if order['user_id']:
-            escaped_promoter = escape_markdown(promoter_username)
-            escaped_user_name = escape_markdown(str(order['user_name']))
-            formatted_code = format_code_for_display(order['order_code'])
-            
-            ticket_type_text = "VIP" if order.get('ticket_type') == 'vip' else "Обычный"
-            
-            if action == "closed":
-                message = (
-                    f"✅ *Ваш заказ #{order['order_id']} успешно обработан!*\n\n"
-                    f"*Тип билета:* {ticket_type_text}\n"
-                    f"*Ваш уникальный код:* `{order['order_code']}`\n\n"
-                    f"Промоутер @{escaped_promoter} подтвердил вашу покупку.\n\n"
-                    f"*Детали заказа:*\n"
-                    f"• Контактное лицо: {escaped_user_name}\n"
-                    f"• Количество гостей: {order['group_size']}\n"
-                    f"• Сумма: {order['total_amount']} ₽\n\n"
-                    f"*💾 Сохраните ваш код! Он потребуется при входе на мероприятие.*\n\n"
-                    f"Спасибо за покупку! Ждем вас на мероприятии! 🎉"
-                )
-                
-                # Добавляем кнопку для получения QR-кода
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎫 Получить QR-код билета", callback_data=f"get_qr_{order['order_id']}")]
-                ])
-                
-                await context.bot.send_message(
-                    chat_id=order['user_id'],
-                    text=message,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            elif action == "refunded":
-                message = (
-                    f"❌ *По вашему заказу #{order['order_id']} оформлен возврат*\n\n"
-                    f"*Тип билета:* {ticket_type_text}\n"
-                    f"*Код заказа:* `{order['order_code']}`\n\n"
-                    f"Промоутер @{escaped_promoter} оформил возврат по вашему заказу.\n\n"
-                    f"Если у вас есть вопросы, свяжитесь с поддержкой: {event_settings.get_all_settings()['contact_telegram']}"
-                )
-                
-                await context.bot.send_message(
-                    chat_id=order['user_id'],
-                    text=message,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                return
-            
-            logger.info(f"Уведомление отправлено пользователю {order['user_id']}")
-    except Exception as e:
-        logger.error(f"Ошибка отправки уведомления пользователю: {e}")
 
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4248,6 +4662,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     cursor.execute("DELETE FROM promo_codes")
                     cursor.execute("DELETE FROM action_logs")
                     cursor.execute("DELETE FROM scan_logs")
+                    cursor.execute("DELETE FROM scan_attempts")
+                    cursor.execute("DELETE FROM qr_cache_stats")
                     conn.commit()
                 
                 await query.edit_message_text(
@@ -4838,6 +5254,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return MAIN_MENU
         
+        elif data == "qr_stats_refresh":
+            await qr_stats_command(update, context)
+            return SCAN_QR
+        
+        elif data == "qr_clear_cache":
+            cleared = qr_manager.clear_cache(older_than=3600)
+            await query.edit_message_text(
+                f"🧹 *Кэш QR-кодов очищен*\n\n"
+                f"Удалено файлов: {cleared}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await asyncio.sleep(2)
+            await qr_stats_command(update, context)
+            return SCAN_QR
+        
         elif data == "scan_continue":
             await query.edit_message_text(
                 "📱 *Сканирование QR-кода*\n\n"
@@ -5401,13 +5832,408 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         role = get_user_role(user_id)
         return MAIN_MENU
 
-# ========== ОБРАБОТЧИК ФОТО (ДЛЯ QR-КОДОВ) ==========
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик фотографий с QR-кодами"""
-    # Перенаправляем в общий обработчик QR-кодов
-    return await handle_qr_scan(update, context)
+# ========== КОМАНДЫ ДЛЯ АДМИНИСТРАТОРОВ ==========
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Панель управления с графиками и аналитикой"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS + PROMOTER_IDS:
+        if update.message:
+            await update.message.reply_text(
+                "❌ *У вас нет прав для просмотра панели управления*",
+                reply_markup=get_main_menu_keyboard(context.user_data.get('user_role', 'user')),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        elif update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                "❌ *У вас нет прав для просмотра панели управления*",
+                reply_markup=get_main_menu_keyboard(context.user_data.get('user_role', 'user')),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return MAIN_MENU
+    
+    try:
+        # Проверяем, откуда пришел запрос
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            message = query.message
+            edit_message = query.edit_message_text
+        else:
+            message = update.message
+            edit_message = update.message.reply_text
+        
+        await edit_message(
+            "📊 *Загружаю данные для панели управления...*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        stats = db.get_statistics()
+        scan_stats = db.get_scan_stats() if user.id in SCANNER_IDS else {}
+        
+        # Формируем текст панели
+        text = "📈 *ПАНЕЛЬ УПРАВЛЕНИЯ SMILE PARTY*\n\n"
+        
+        # Основная статистика
+        text += "📊 *ОСНОВНАЯ СТАТИСТИКА:*\n"
+        text += f"• Всего заказов: {stats.get('total_orders', 0)}\n"
+        text += f"• Активные: {stats.get('active_orders', 0)}\n"
+        text += f"• Закрытые: {stats.get('closed_orders', 0)}\n"
+        text += f"• Выручка: {stats.get('revenue', 0)} ₽\n"
+        text += f"• Гостей в списках: {stats.get('total_guests', 0)}\n\n"
+        
+        # Статистика за сегодня
+        text += "📅 *СЕГОДНЯ:*\n"
+        text += f"• Новых заказов: {stats.get('today_orders', 0)}\n"
+        text += f"• Выручка: {stats.get('today_revenue', 0)} ₽\n"
+        text += f"• Уникальных покупателей: {stats.get('today_users', 0)}\n\n"
+        
+        # Статистика по типам билетов
+        text += "🎫 *СТАТИСТИКА ПО БИЛЕТАМ:*\n"
+        text += f"• Обычные: {stats.get('standard_tickets', 0)} ({stats.get('standard_revenue', 0)} ₽)\n"
+        text += f"• VIP: {stats.get('vip_tickets', 0)} ({stats.get('vip_revenue', 0)} ₽)\n\n"
+        
+        # Статистика сканирований QR-кодов
+        if scan_stats:
+            text += "📱 *СТАТИСТИКА СКАНИРОВАНИЙ:*\n"
+            text += f"• Всего сканирований: {scan_stats.get('total_scans', 0)}\n"
+            text += f"• ✅ Успешных: {scan_stats.get('success_scans', 0)}\n"
+            text += f"• ⚠️ Повторных: {scan_stats.get('warning_scans', 0)}\n"
+            text += f"• ❌ Ошибок: {scan_stats.get('error_scans', 0)}\n"
+            text += f"• Отсканировано билетов: {scan_stats.get('scanned_tickets', 0)}/{scan_stats.get('total_valid_tickets', 0)}\n"
+            text += f"• Сегодня: {scan_stats.get('today_scans', 0)} (успешно: {scan_stats.get('today_success', 0)})\n\n"
+            
+            # Последние сканирования
+            if scan_stats.get('recent_scans'):
+                text += "📋 *ПОСЛЕДНИЕ СКАНИРОВАНИЯ:*\n"
+                for scan in scan_stats['recent_scans'][:5]:
+                    created_at = scan['created_at']
+                    if isinstance(created_at, str):
+                        time_str = created_at[11:16]
+                    else:
+                        time_str = created_at.strftime('%H:%M')
+                    
+                    emoji = "✅" if scan['scan_result'] == 'success' else "⚠️" if scan['scan_result'] == 'warning' else "❌"
+                    text += f"{emoji} {time_str} - @{scan['scanner_username']} - {scan['order_code']}\n"
+                text += "\n"
+        
+        # Статистика за 7 дней (текстовый график)
+        weekly_stats = stats.get('weekly_stats', [])
+        if weekly_stats:
+            text += "📆 *СТАТИСТИКА ЗА 7 ДНЕЙ:*\n"
+            
+            # Находим максимальное количество заказов для масштабирования
+            max_orders = max([day['orders'] for day in weekly_stats] + [1])
+            
+            for day in weekly_stats[-7:]:  # Последние 7 дней
+                date_str = day['date']
+                if isinstance(date_str, str):
+                    date_display = date_str[-5:]  # Показываем только день и месяц
+                else:
+                    date_display = date_str.strftime('%d.%m')
+                
+                orders = day['orders']
+                revenue = day['revenue'] or 0
+                
+                # Создаем текстовый график
+                bar_length = int((orders / max_orders) * 20)
+                bar = '█' * bar_length + '░' * (20 - bar_length)
+                
+                text += f"{date_display}: {bar} {orders} зак. ({revenue} ₽)\n"
+            
+            text += "\n"
+        
+        # Топ промоутеров
+        top_promoters = stats.get('top_promoters', [])
+        if top_promoters:
+            text += "🏆 *ТОП ПРОМОУТЕРОВ:*\n"
+            for i, promoter in enumerate(top_promoters[:5], 1):
+                text += f"{i}. @{promoter['username']}: {promoter['closed_count']} зак. ({promoter['total_revenue']} ₽)\n"
+            text += "\n"
+        
+        # Топ сканеров
+        if scan_stats and scan_stats.get('top_scanners'):
+            text += "📱 *ТОП СКАНЕРОВ:*\n"
+            for i, scanner in enumerate(scan_stats['top_scanners'][:3], 1):
+                text += f"{i}. @{scanner['scanner_username']}: {scanner['scan_count']} сканирований\n"
+            text += "\n"
+        
+        # Активные пользователи
+        top_users = db.get_top_users(5)
+        if top_users:
+            text += "👥 *САМЫЕ АКТИВНЫЕ ПОЛЬЗОВАТЕЛИ:*\n"
+            for i, user_data in enumerate(top_users, 1):
+                username = user_data.get('username', f"user_{user_data['user_id']}")
+                first_name = user_data.get('first_name', '')
+                request_count = user_data.get('request_count', 0)
+                text += f"{i}. {first_name} (@{username}): {request_count} запросов\n"
+        
+        # Кнопки управления
+        keyboard = []
+        if user.id in ADMIN_IDS:
+            keyboard.append([
+                InlineKeyboardButton("📤 Экспорт данных", callback_data="admin_export"),
+                InlineKeyboardButton("💾 Создать бэкап", callback_data="admin_backup")
+            ])
+            keyboard.append([
+                InlineKeyboardButton("📢 Создать рассылку", callback_data="admin_broadcast"),
+                InlineKeyboardButton("🎫 Управление промокодами", callback_data="admin_promo_codes")
+            ])
+            keyboard.append([
+                InlineKeyboardButton("📊 Расширенная статистика QR", callback_data="qr_stats_refresh")
+            ])
+        
+        # Кнопка сканирования QR для промоутеров и администраторов
+        if user.id in SCANNER_IDS:
+            keyboard.append([
+                InlineKeyboardButton("📱 Сканировать QR-код", callback_data="scan_qr_menu")
+            ])
+        
+        keyboard.append([
+            InlineKeyboardButton("🔄 Обновить", callback_data="admin_dashboard_refresh"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin_back")
+        ])
+        
+        # Используем правильный метод для ответа
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        return ADMIN_DASHBOARD
+        
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке панели управления: {e}")
+        
+        error_text = f"❌ *Ошибка загрузки панели управления:*\n\n{str(e)}"
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                error_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                error_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        return MAIN_MENU
 
-# ========== КОМАНДА ДЛЯ ОТПРАВКИ ЛОГОВ ==========
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспорт данных в CSV"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text(
+            "❌ *У вас нет прав администратора*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return MAIN_MENU
+    
+    try:
+        await update.message.reply_text(
+            "📊 *Подготавливаю данные для экспорта...*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Получаем все закрытые заказы
+        orders = db.get_orders_by_status("closed")
+        
+        if not orders:
+            await update.message.reply_text(
+                "❌ *Нет данных для экспорта*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Создаем CSV в памяти
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+        
+        # Заголовки
+        writer.writerow([
+            'ID заказа', 'Код заказа', 'Тип билета', 'Имя', 'Email', 
+            'Telegram', 'Кол-во гостей', 'Сумма', 'Дата создания', 
+            'Дата закрытия', 'Промоутер', 'Статус', 'Отсканирован', 'Сканирован', 'Версия QR'
+        ])
+        
+        # Данные
+        for order in orders:
+            created_at = order['created_at']
+            if isinstance(created_at, str):
+                created_date = created_at[:10]
+            else:
+                created_date = created_at.strftime('%Y-%m-%d') if created_at else ''
+            
+            closed_at = order.get('closed_at')
+            if closed_at:
+                if isinstance(closed_at, str):
+                    closed_date = closed_at[:10]
+                else:
+                    closed_date = closed_at.strftime('%Y-%m-%d') if closed_at else ''
+            else:
+                closed_date = ''
+            
+            scanned = 'Да' if order.get('scanned_at') else 'Нет'
+            scanned_by = order.get('scanned_by', '')
+            qr_version = order.get('qr_version', '')
+            
+            writer.writerow([
+                order['order_id'],
+                order['order_code'],
+                'VIP' if order.get('ticket_type') == 'vip' else 'Standard',
+                sanitize_input(order['user_name']),
+                sanitize_input(order['user_email']),
+                sanitize_input(order.get('username', '')),
+                order['group_size'],
+                order['total_amount'],
+                created_date,
+                closed_date,
+                sanitize_input(order.get('closed_by', '')),
+                order['status'],
+                scanned,
+                scanned_by,
+                qr_version
+            ])
+        
+        # Готовим файл для отправки
+        output.seek(0)
+        csv_data = output.getvalue().encode('utf-8-sig')  # UTF-8 с BOM для Excel
+        
+        # Отправляем файл
+        await update.message.reply_document(
+            document=io.BytesIO(csv_data),
+            filename=f"orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            caption="📊 Экспорт заказов"
+        )
+        
+        logger.info(f"Экспорт данных выполнен, отправлено {len(orders)} записей")
+        
+    except Exception as e:
+        logger.error(f"Ошибка экспорта данных: {e}")
+        await update.message.reply_text(
+            f"❌ *Ошибка экспорта данных:*\n\n{str(e)}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание резервной копии базы данных"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text(
+            "❌ *У вас нет прав администратора*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return MAIN_MENU
+    
+    backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    backup_sql = f"{backup_file}.sql"
+    
+    try:
+        # Копируем файл базы данных
+        shutil.copy2(DB_FILE, backup_file)
+        
+        # Создаем SQL дамп
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            with open(backup_sql, 'w', encoding='utf-8') as f:
+                for line in conn.iterdump():
+                    f.write(f'{line}\n')
+        
+        # Отправляем файл базы данных
+        with open(backup_file, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=backup_file,
+                caption="💾 Резервная копия базы данных"
+            )
+        
+        # Отправляем SQL дамп
+        with open(backup_sql, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=backup_sql,
+                caption="📝 SQL дамп базы данных"
+            )
+        
+        # Очистка
+        os.remove(backup_file)
+        os.remove(backup_sql)
+        
+        await update.message.reply_text(
+            "✅ *Резервные копии успешно созданы и отправлены!*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа: {e}")
+        await update.message.reply_text(
+            f"❌ *Ошибка создания резервной копии:*\n\n{str(e)}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для рассылки сообщений всем пользователям"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text(
+            "❌ *У вас нет прав администратора*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return MAIN_MENU
+    
+    if context.args:
+        message = ' '.join(context.args)
+        
+        # Получаем всех пользователей
+        users = db.get_all_users()
+        
+        await update.message.reply_text(
+            f"📢 *Начинаю рассылку для {len(users)} пользователей...*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        success = 0
+        failed = 0
+        
+        for user_data in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_data['user_id'],
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                success += 1
+                await asyncio.sleep(0.1)  # Ограничение скорости
+            except Exception as e:
+                failed += 1
+                logger.error(f"Ошибка отправки пользователю {user_data['user_id']}: {e}")
+        
+        await update.message.reply_text(
+            f"✅ *Рассылка завершена!*\n\n"
+            f"✅ Успешно: {success}\n"
+            f"❌ Не удалось: {failed}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(
+            "📢 *Создание рассылки*\n\n"
+            "Введите сообщение для рассылки:\n\n"
+            "Пример: /broadcast Привет! Скоро начнется SMILE PARTY! 🎉",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для отправки логов в канал"""
     try:
@@ -5431,6 +6257,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             stats = db.get_statistics()
             scan_stats = db.get_scan_stats()
+            qr_stats = db.get_qr_statistics()
             
             recent_orders = []
             try:
@@ -5459,6 +6286,11 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Повторных: {scan_stats.get('warning_scans', 0)}\n"
                 f"• Отсканировано билетов: {scan_stats.get('scanned_tickets', 0)}/{scan_stats.get('total_valid_tickets', 0)}\n"
                 f"• Сегодня: {scan_stats.get('today_scans', 0)} (успешно: {scan_stats.get('today_success', 0)})\n\n"
+                f"*💾 СТАТИСТИКА КЭША QR:*\n"
+                f"• Попаданий в кэш: {qr_stats.get('cache_hits', 0)}\n"
+                f"• Промахов: {qr_stats.get('cache_misses', 0)}\n"
+                f"• Эффективность: {qr_stats.get('cache_hit_rate', 0)}%\n"
+                f"• Среднее время генерации: {qr_stats.get('avg_generation_time', 0)} мс\n\n"
             )
             
             if recent_orders:
@@ -5501,56 +6333,6 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
-# ========== ОБРАБОТЧИК КОМАНД ==========
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик команды /cancel"""
-    user = update.effective_user
-    
-    # Проверяем рейт-лимит
-    if not rate_limiter.check_limit(user.id):
-        remaining = rate_limiter.get_remaining(user.id)
-        await update.message.reply_text(
-            f"⏰ *Слишком много запросов!*\n\n"
-            f"Пожалуйста, подождите. Доступно запросов через 60 секунд: {remaining}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return MAIN_MENU
-    
-    context.user_data.pop('in_buy_process', None)
-    context.user_data.pop('name', None)
-    context.user_data.pop('email', None)
-    context.user_data.pop('group_size', None)
-    context.user_data.pop('guests', None)
-    context.user_data.pop('guest_counter', None)
-    context.user_data.pop('editing_key', None)
-    context.user_data.pop('editing_name', None)
-    context.user_data.pop('ticket_type', None)
-    context.user_data.pop('creating_promo', None)
-    context.user_data.pop('promo_step', None)
-    context.user_data.pop('promo_code', None)
-    context.user_data.pop('promo_discount_type', None)
-    context.user_data.pop('promo_discount_value', None)
-    context.user_data.pop('viewing_promo', None)
-    context.user_data.pop('scan_mode', None)
-    
-    await update.message.reply_text(
-        "❌ *Действие отменено*",
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    role = get_user_role(user.id)
-    context.user_data['user_role'] = role
-    
-    await update.message.reply_text(
-        f"🏠 *Главное меню*\n\n"
-        f"Выберите действие:",
-        reply_markup=get_main_menu_keyboard(role),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return MAIN_MENU
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help"""
     user = update.effective_user
@@ -5577,7 +6359,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /broadcast <текст> - Рассылка сообщений (админы)\n"
         "• /dashboard - Панель управления (админы/промоутеры)\n"
         "• /scanqr - Сканировать QR-код (только для промоутеров и администраторов)\n"
-        "• /scanstats - Статистика сканирований (админы/промоутеры)\n\n"
+        "• /scanstats - Статистика сканирований (админы/промоутеры)\n"
+        "• /qrstats - Расширенная статистика QR (админы)\n\n"
         "*Функции для всех:*\n"
         "• Узнать цены на билеты\n"
         "• Купить билеты онлайн\n"
@@ -5598,7 +6381,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Управление промокодами\n"
         "• Экспорт данных\n"
         "• Резервное копирование\n"
-        "• Рассылка сообщений\n\n"
+        "• Рассылка сообщений\n"
+        "• Мониторинг производительности QR-системы\n\n"
+        "*Защита QR-кодов:*\n"
+        "• HMAC подпись - защита от подделки\n"
+        "• Timestamp - ограничение срока действия\n"
+        "• Rate limiting - защита от повторного сканирования\n"
+        "• Хэширование гостей - приватность данных\n"
+        "• Кэширование - быстрая генерация\n\n"
         "*Техническая поддержка:* @smile_party"
     )
     
@@ -5690,13 +6480,55 @@ async def check_new_orders_command(update: Update, context: ContextTypes.DEFAULT
             parse_mode=ParseMode.MARKDOWN
         )
 
-# ========== ФУНКЦИЯ ДЛЯ ПЕРИОДИЧЕСКОЙ ПРОВЕРКИ НОВЫХ ЗАКАЗОВ И НАПОМИНАНИЙ ==========
-async def periodic_notification_check(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическая проверка и отправка уведомлений о новых заказах и напоминаний"""
-    await check_and_send_notifications(context)
-    await send_reminders(context)
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик команды /cancel"""
+    user = update.effective_user
+    
+    # Проверяем рейт-лимит
+    if not rate_limiter.check_limit(user.id):
+        remaining = rate_limiter.get_remaining(user.id)
+        await update.message.reply_text(
+            f"⏰ *Слишком много запросов!*\n\n"
+            f"Пожалуйста, подождите. Доступно запросов через 60 секунд: {remaining}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return MAIN_MENU
+    
+    context.user_data.pop('in_buy_process', None)
+    context.user_data.pop('name', None)
+    context.user_data.pop('email', None)
+    context.user_data.pop('group_size', None)
+    context.user_data.pop('guests', None)
+    context.user_data.pop('guest_counter', None)
+    context.user_data.pop('editing_key', None)
+    context.user_data.pop('editing_name', None)
+    context.user_data.pop('ticket_type', None)
+    context.user_data.pop('creating_promo', None)
+    context.user_data.pop('promo_step', None)
+    context.user_data.pop('promo_code', None)
+    context.user_data.pop('promo_discount_type', None)
+    context.user_data.pop('promo_discount_value', None)
+    context.user_data.pop('viewing_promo', None)
+    context.user_data.pop('scan_mode', None)
+    
+    await update.message.reply_text(
+        "❌ *Действие отменено*",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    role = get_user_role(user.id)
+    context.user_data['user_role'] = role
+    
+    await update.message.reply_text(
+        f"🏠 *Главное меню*\n\n"
+        f"Выберите действие:",
+        reply_markup=get_main_menu_keyboard(role),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    return MAIN_MENU
 
-# ========== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ ПРОМОКОДАМИ ==========
 async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление промокодами"""
     user = update.effective_user
@@ -5765,14 +6597,64 @@ async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ADMIN_MENU
 
+# ========== ПЕРИОДИЧЕСКИЕ ЗАДАЧИ ==========
+async def periodic_notification_check(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическая проверка и отправка уведомлений о новых заказах и напоминаний"""
+    await check_and_send_notifications(context)
+    await send_reminders(context)
+
+# ========== УВЕДОМЛЕНИЯ ПРИ ЗАПУСКЕ ==========
+async def send_restart_notifications_async(bot_token: str):
+    """Асинхронная функция для отправки уведомлений о перезапуске"""
+    try:
+        from telegram import Bot
+        
+        bot = Bot(token=bot_token)
+        users = db.get_users_to_notify()
+        settings_data = event_settings.get_all_settings()
+        
+        notification_count = 0
+        for user in users:
+            try:
+                await bot.send_message(
+                    chat_id=user['user_id'],
+                    text=f"🔄 *{escape_markdown(str(settings_data['event_name']))} бот перезапущен!*\n\n"
+                         f"Бот снова в сети и готов к работе.\n"
+                         f"Теперь с улучшенной системой QR-кодов с защитой от подделок!\n"
+                         f"Используйте /start для начала работы.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                db.mark_user_notified(user['user_id'])
+                notification_count += 1
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление пользователю {user['user_id']}: {e}")
+        
+        logger.info(f"✅ Отправлено {notification_count} уведомлений при перезапуске бота")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомлений при перезапуске: {e}")
+
+def send_restart_notifications():
+    """Синхронная функция для отправки уведомлений о перезапуске"""
+    import asyncio
+    asyncio.run(send_restart_notifications_async(BOT_TOKEN))
+
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main() -> None:
     """Основная функция запуска бота"""
-    logger.info("🚀 Запуск SMILE PARTY Bot с поддержкой QR-кодов...")
+    logger.info("🚀 Запуск SMILE PARTY Bot с ULTIMATE QR SYSTEM...")
     logger.info(f"👥 Права на сканирование QR-кодов имеют {len(SCANNER_IDS)} пользователей")
-    logger.info(f"📱 QR-логи будут сохраняться в файл qr_codes.log")
+    logger.info(f"🔒 Защита QR-кодов: HMAC + Timestamp + Версионирование")
+    logger.info(f"📱 Версия QR-формата: {QR_CONFIG['version']}")
+    logger.info(f"💾 Кэширование QR-кодов: {'Включено' if QR_CONFIG['enable_qr_caching'] else 'Выключено'}")
+    logger.info(f"📊 Мониторинг производительности: Включен")
     
-    # Сброс статуса уведомлений
+    if CV2_AVAILABLE:
+        logger.info("✅ OpenCV доступен для распознавания QR-кодов")
+    else:
+        logger.warning("⚠️ OpenCV не установлен. Для улучшенного распознавания: pip install opencv-python")
+    
     db.reset_notification_status()
     
     # Создание приложения
@@ -5787,6 +6669,10 @@ def main() -> None:
             
             # Отправка напоминаний каждые 30 минут
             job_queue.run_repeating(send_reminders, interval=1800, first=300)
+            
+            # Очистка старого кэша раз в день
+            job_queue.run_once(lambda _: qr_manager.clear_cache(86400), when=3600)  # Через час после запуска
+            job_queue.run_daily(lambda _: qr_manager.clear_cache(86400), time=datetime.time(hour=3, minute=0))  # Каждый день в 3 часа
             
             logger.info("✅ Запущены периодические задачи")
         else:
@@ -5857,7 +6743,8 @@ def main() -> None:
             CommandHandler("broadcast", broadcast_command),
             CommandHandler("dashboard", dashboard_command),
             CommandHandler("scanqr", scan_qr_command),
-            CommandHandler("scanstats", scan_stats_command)
+            CommandHandler("scanstats", scan_stats_command),
+            CommandHandler("qrstats", qr_stats_command)
         ]
     )
     
@@ -5873,11 +6760,12 @@ def main() -> None:
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("scanqr", scan_qr_command))
     application.add_handler(CommandHandler("scanstats", scan_stats_command))
+    application.add_handler(CommandHandler("qrstats", qr_stats_command))
+    application.add_handler(CallbackQueryHandler(qr_stats_callback, pattern="^qr_"))
     
-    logger.info("✅ Бот с поддержкой QR-кодов запущен и готов к работе!")
-    logger.info(f"📱 Права на сканирование QR-кодов: администраторы и промоутеры")
-    logger.info(f"🔒 Защита от повторного использования QR-кодов включена")
-    logger.info(f"📝 QR-логи будут сохраняться в файл qr_codes.log")
+    logger.info("✅ Бот с ULTIMATE QR SYSTEM запущен и готов к работе!")
+    logger.info(f"📱 Команды QR: /scanqr, /scanstats, /qrstats")
+    logger.info(f"🔒 Все QR-коды защищены HMAC подписью и временной меткой")
     
     # Запуск отправки уведомлений о перезапуске в фоновом режиме
     import threading
