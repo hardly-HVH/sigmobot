@@ -1302,3 +1302,30 @@ telegram.error.Conflict: Conflict: terminated by other getUpdates request; make 
 2026-02-20 00:31:16 - apscheduler.executors.default - INFO - Job "periodic_notification_check (trigger: interval[0:00:30], next run at: 2026-02-19 21:31:46 UTC)" executed successfully
 2026-02-20 00:31:23 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/getUpdates "HTTP/1.1 200 OK"
 2026-02-20 00:31:33 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/getUpdates "HTTP/1.1 200 OK"
+2026-02-20 15:00:47 - root - INFO - ✅ Таблицы SQLite базы данных инициализированы
+2026-02-20 15:00:47 - root - INFO - 🔧 Проверка структуры базы данных...
+2026-02-20 15:00:47 - root - INFO - ✅ Структура базы данных проверена
+2026-02-20 15:00:47 - root - INFO - 🔧 Проверка структуры базы данных...
+2026-02-20 15:00:47 - root - INFO - ✅ Структура базы данных проверена
+2026-02-20 15:00:47 - root - INFO - 🚀 Запуск SMILE PARTY Bot с поддержкой QR-кодов...
+2026-02-20 15:00:47 - root - INFO - 👥 Права на сканирование QR-кодов имеют 16 пользователей
+2026-02-20 15:00:47 - root - INFO - 📱 QR-логи будут сохраняться в файл qr_codes.log
+2026-02-20 15:00:47 - root - INFO - ✅ Статус уведомлений сброшен для всех пользователей
+2026-02-20 15:00:47 - apscheduler.scheduler - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-02-20 15:00:47 - apscheduler.scheduler - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-02-20 15:00:47 - root - INFO - ✅ Запущены периодические задачи
+2026-02-20 15:00:47 - root - INFO - ✅ Бот с поддержкой QR-кодов запущен и готов к работе!
+2026-02-20 15:00:47 - root - INFO - 📱 Права на сканирование QR-кодов: администраторы и промоутеры
+2026-02-20 15:00:47 - root - INFO - 🔒 Защита от повторного использования QR-кодов включена
+2026-02-20 15:00:47 - root - INFO - 📝 QR-логи будут сохраняться в файл qr_codes.log
+2026-02-20 15:00:48 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/getMe "HTTP/1.1 200 OK"
+2026-02-20 15:00:48 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/deleteWebhook "HTTP/1.1 200 OK"
+2026-02-20 15:00:48 - apscheduler.scheduler - INFO - Added job "periodic_notification_check" to job store "default"
+2026-02-20 15:00:48 - apscheduler.scheduler - INFO - Added job "send_reminders" to job store "default"
+2026-02-20 15:00:48 - apscheduler.scheduler - INFO - Scheduler started
+2026-02-20 15:00:48 - telegram.ext.Application - INFO - Application started
+2026-02-20 15:00:52 - root - INFO - 🔄 Начинаю отправку уведомлений о перезапуске...
+2026-02-20 15:00:53 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/sendMessage "HTTP/1.1 200 OK"
+2026-02-20 15:00:53 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/sendMessage "HTTP/1.1 200 OK"
+2026-02-20 15:00:53 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8433063885:AAFPT2fYk6HQB1gt-x2kxqaIaSJE9U3tQdM/sendMessage "HTTP/1.1 200 OK"
+2026-02-20 15:00:54 - root - INFO - ✅ Отправлено 3 уведомлений при перезапуске бота
