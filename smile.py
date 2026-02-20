@@ -36,14 +36,16 @@ from functools import lru_cache
 # QR Code libraries
 import qrcode
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
+import numpy as np
 
 # For QR scanning
 try:
     import cv2
-    import numpy as np
     from pyzbar.pyzbar import decode
     CV2_AVAILABLE = True
 except ImportError:
+    cv2 = None
+    decode = None
     CV2_AVAILABLE = False
     print("⚠️ OpenCV не установлен. Используется базовое распознавание QR-кодов.")
     print("   Для установки: pip install opencv-python pyzbar")
@@ -75,16 +77,16 @@ DB_FILE = "smile_party_bot.db"
 
 # ========== НАСТРОЙКИ QR-КОДОВ ==========
 QR_CONFIG = {
-    "secret_key": "smile_party_super_secret_key_2024_CHANGE_ME",  # Изменить в продакшене!
+    "secret_key": "smile_party_super_secret_key_2024_CHANGE_ME",
     "version": "1.0",
     "cache_dir": "qr_cache",
-    "cache_ttl": 86400,  # 24 часа
+    "cache_ttl": 86400,
     "qr_size": 10,
-    "logo_path": None,  # Путь к логотипу для стилизации
+    "logo_path": None,
     "enable_watermark": True,
     "watermark_text": "SMILE PARTY",
     "max_scan_attempts": 3,
-    "scan_timeout": 60,  # секунд между сканированиями одного билета
+    "scan_timeout": 60,
     "offline_mode": False,
     "enable_hmac": True,
     "enable_timestamp": True,
@@ -106,7 +108,6 @@ TICKET_TYPES = {
 
 # ========== НАСТРОЙКА РАСШИРЕННОГО ЛОГИРОВАНИЯ ==========
 def setup_advanced_logging():
-    """Настройка расширенного логирования"""
     import sys
     import io
     
@@ -180,8 +181,6 @@ logger, user_logger, qr_logger, perf_logger = setup_advanced_logging()
 
 # ========== QR CODE MANAGER ==========
 class QRCodeManager:
-    """Менеджер QR-кодов с защитой, кэшированием и мониторингом"""
-    
     def __init__(self, config: Dict = None):
         self.config = config or QR_CONFIG
         self.stats = defaultdict(int)
@@ -189,12 +188,10 @@ class QRCodeManager:
         self.cache = {}
         self.last_scan = defaultdict(float)
         
-        # Создаем директорию для кэша
         if self.config["enable_qr_caching"]:
             os.makedirs(self.config["cache_dir"], exist_ok=True)
             logger.info(f"📁 Директория кэша QR-кодов: {self.config['cache_dir']}")
         
-        # Подключаем Redis если доступен
         self.redis_client = None
         if REDIS_AVAILABLE:
             try:
@@ -214,7 +211,6 @@ class QRCodeManager:
         logger.info("🚀 QR Code Manager инициализирован")
     
     def _generate_hmac(self, data: str) -> str:
-        """Генерирует HMAC подпись для данных"""
         if not self.config["enable_hmac"]:
             return ""
         
@@ -223,11 +219,10 @@ class QRCodeManager:
             self.config["secret_key"].encode('utf-8'),
             message,
             hashlib.sha256
-        ).hexdigest()[:8]  # Берем первые 8 символов для компактности
+        ).hexdigest()[:8]
         return signature
     
     def _verify_hmac(self, data: str, signature: str) -> bool:
-        """Проверяет HMAC подпись"""
         if not self.config["enable_hmac"]:
             return True
         
@@ -235,7 +230,6 @@ class QRCodeManager:
         return hmac.compare_digest(expected, signature)
     
     def _add_timestamp(self, data: str) -> str:
-        """Добавляет временную метку к данным"""
         if not self.config["enable_timestamp"]:
             return data
         
@@ -243,7 +237,6 @@ class QRCodeManager:
         return f"{data}|{timestamp}"
     
     def _verify_timestamp(self, data: str, max_age: int = 86400) -> Tuple[bool, str]:
-        """Проверяет временную метку"""
         if '|' not in data or not self.config["enable_timestamp"]:
             return True, data
         
@@ -260,26 +253,18 @@ class QRCodeManager:
             return False, data
     
     def prepare_qr_data(self, order_code: str, ticket_type: str = "standard", guest_name: str = "") -> str:
-        """Подготавливает данные для QR-кода с защитой"""
         base_data = f"SMILE_PARTY:{order_code}:{ticket_type}"
         if guest_name:
-            # Хэшируем имя гостя для приватности
             guest_hash = hashlib.md5(guest_name.encode()).hexdigest()[:8]
             base_data += f":{guest_hash}"
         
-        # Добавляем версию формата
         base_data = f"V{self.config['version']}:{base_data}"
-        
-        # Добавляем временную метку
         data_with_time = self._add_timestamp(base_data)
-        
-        # Добавляем HMAC подпись
         signature = self._generate_hmac(data_with_time)
         
         return f"{data_with_time}|{signature}"
     
     def parse_qr_data(self, qr_data: str) -> Dict:
-        """Парсит и проверяет данные из QR-кода"""
         result = {
             "valid": False,
             "code": None,
@@ -290,7 +275,6 @@ class QRCodeManager:
         }
         
         try:
-            # Разделяем данные и подпись
             parts = qr_data.split('|')
             if len(parts) < 2:
                 result["error"] = "Неверный формат данных"
@@ -299,18 +283,15 @@ class QRCodeManager:
             data_part = '|'.join(parts[:-1])
             signature = parts[-1]
             
-            # Проверяем подпись
             if not self._verify_hmac(data_part, signature):
                 result["error"] = "Недействительная подпись"
                 return result
             
-            # Проверяем временную метку
             timestamp_valid, data_without_time = self._verify_timestamp(data_part)
             if not timestamp_valid:
                 result["error"] = "Истек срок действия QR-кода"
                 return result
             
-            # Парсим основную структуру
             main_parts = data_without_time.split(':')
             if len(main_parts) < 3:
                 result["error"] = "Неверная структура данных"
@@ -341,12 +322,10 @@ class QRCodeManager:
         return result
     
     def generate_qr_image(self, data: str, ticket_type: str = "standard", guest_name: str = "") -> bytes:
-        """Генерирует стилизованный QR-код"""
         start_time = time.time()
         
         cache_key = hashlib.md5(f"{data}_{ticket_type}_{guest_name}".encode()).hexdigest()
         
-        # Проверяем кэш
         cached = self._get_from_cache(cache_key)
         if cached:
             self.stats["cache_hits"] += 1
@@ -359,7 +338,6 @@ class QRCodeManager:
         try:
             logger.info(f"🚀 Генерация QR-кода для: {data[:30]}...")
             
-            # Создаем QR-код с повышенной коррекцией ошибок
             qr = qrcode.QRCode(
                 version=None,
                 error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -371,27 +349,20 @@ class QRCodeManager:
             qr.add_data(prepared_data)
             qr.make(fit=True)
             
-            # Создаем изображение
             img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
             
-            # Добавляем логотип если есть
             if self.config["logo_path"] and os.path.exists(self.config["logo_path"]):
                 img = self._add_logo(img)
             
-            # Добавляем водяной знак
             if self.config["enable_watermark"]:
                 img = self._add_watermark(img, self.config["watermark_text"])
             
-            # Добавляем рамку и текст
             img = self._add_styling(img, data, ticket_type, guest_name)
             
-            # Конвертируем в байты
             img_bytes = self._image_to_bytes(img)
             
-            # Сохраняем в кэш
             self._save_to_cache(cache_key, img_bytes)
             
-            # Обновляем статистику
             with self.stats_lock:
                 self.stats["qr_generated"] += 1
                 self.stats["total_generation_time"] += time.time() - start_time
@@ -410,26 +381,21 @@ class QRCodeManager:
             
             perf_logger.info(f"QR_GEN_ERROR,{cache_key[:8]},{str(e)[:50]}")
             
-            # Возвращаем простой QR-код в случае ошибки
             return self._generate_fallback_qr(data)
     
     def _add_logo(self, img: Image.Image) -> Image.Image:
-        """Добавляет логотип в центр QR-кода"""
         try:
             logo = Image.open(self.config["logo_path"])
             
-            # Вычисляем размер логотипа (20% от QR-кода)
             qr_width, qr_height = img.size
             logo_size = int(qr_width * 0.2)
             
             logo = logo.resize((logo_size, logo_size), Image.Resampling.LANCZOS)
             
-            # Создаем маску для закругления углов
             mask = Image.new('L', (logo_size, logo_size), 0)
             draw = ImageDraw.Draw(mask)
             draw.ellipse((0, 0, logo_size, logo_size), fill=255)
             
-            # Вставляем логотип
             pos = ((qr_width - logo_size) // 2, (qr_height - logo_size) // 2)
             img.paste(logo, pos, mask)
             
@@ -441,28 +407,22 @@ class QRCodeManager:
         return img
     
     def _add_watermark(self, img: Image.Image, text: str) -> Image.Image:
-        """Добавляет водяной знак"""
         try:
             draw = ImageDraw.Draw(img)
             
-            # Пытаемся загрузить шрифт
             try:
                 font = ImageFont.truetype("arial.ttf", 20)
             except:
                 font = ImageFont.load_default()
             
-            # Получаем размеры изображения
             width, height = img.size
             
-            # Добавляем полупрозрачный текст по диагонали
             for i in range(0, width, 100):
                 for j in range(0, height, 100):
-                    # Создаем полупрозрачный слой
                     txt_img = Image.new('RGBA', img.size, (255,255,255,0))
                     txt_draw = ImageDraw.Draw(txt_img)
                     txt_draw.text((i, j), text, fill=(128,128,128,30), font=font)
                     
-                    # Накладываем на оригинал
                     img = Image.alpha_composite(img.convert('RGBA'), txt_img)
             
             logger.debug("✅ Водяной знак добавлен")
@@ -473,41 +433,33 @@ class QRCodeManager:
         return img
     
     def _add_styling(self, img: Image.Image, data: str, ticket_type: str, guest_name: str) -> Image.Image:
-        """Добавляет стилизацию и текст к QR-коду"""
         try:
             width, height = img.size
             new_height = height + 60
             
-            # Создаем новое изображение с белым фоном
             new_img = Image.new('RGB', (width, new_height), 'white')
             new_img.paste(img, (0, 0))
             
             draw = ImageDraw.Draw(new_img)
             
-            # Загружаем шрифт
             try:
                 font = ImageFont.truetype("arial.ttf", 20)
             except:
                 font = ImageFont.load_default()
             
-            # Формируем текст
             ticket_type_text = "VIP" if ticket_type == "vip" else "STANDARD"
             display_text = f"#{data} | {ticket_type_text}"
             if guest_name:
                 display_text += f" | {guest_name[:20]}"
             
-            # Добавляем текст с тенью
             bbox = draw.textbbox((0, 0), display_text, font=font)
             text_width = bbox[2] - bbox[0]
             text_x = (width - text_width) // 2
             text_y = height + 10
             
-            # Тень
             draw.text((text_x+2, text_y+2), display_text, fill="gray", font=font)
-            # Основной текст
             draw.text((text_x, text_y), display_text, fill="black", font=font)
             
-            # Добавляем рамку
             draw.rectangle([(0, 0), (width-1, height-1)], outline="black", width=1)
             
             logger.debug("✅ Стилизация QR-кода завершена")
@@ -518,14 +470,12 @@ class QRCodeManager:
         return new_img
     
     def _image_to_bytes(self, img: Image.Image) -> bytes:
-        """Конвертирует изображение в байты"""
         img_bytes = io.BytesIO()
         img.save(img_bytes, format='PNG', optimize=True)
         img_bytes.seek(0)
         return img_bytes.getvalue()
     
     def _generate_fallback_qr(self, data: str) -> bytes:
-        """Генерирует простой QR-код в случае ошибки"""
         try:
             qr = qrcode.QRCode(version=1, box_size=10, border=4)
             qr.add_data(data)
@@ -541,7 +491,6 @@ class QRCodeManager:
             
         except Exception as e:
             logger.error(f"❌ Критическая ошибка fallback QR: {e}")
-            # Возвращаем пустое изображение
             img = Image.new('RGB', (200, 200), 'white')
             img_bytes = io.BytesIO()
             img.save(img_bytes, format='PNG')
@@ -549,11 +498,9 @@ class QRCodeManager:
             return img_bytes.getvalue()
     
     def _get_from_cache(self, key: str) -> Optional[bytes]:
-        """Получает QR-код из кэша"""
         if not self.config["enable_qr_caching"]:
             return None
         
-        # Пробуем Redis
         if self.redis_client:
             try:
                 data = self.redis_client.get(f"qr:{key}")
@@ -562,10 +509,8 @@ class QRCodeManager:
             except:
                 pass
         
-        # Пробуем файловый кэш
         cache_path = os.path.join(self.config["cache_dir"], f"{key}.png")
         if os.path.exists(cache_path):
-            # Проверяем возраст файла
             if time.time() - os.path.getmtime(cache_path) < self.config["cache_ttl"]:
                 with open(cache_path, 'rb') as f:
                     return f.read()
@@ -575,11 +520,9 @@ class QRCodeManager:
         return None
     
     def _save_to_cache(self, key: str, data: bytes):
-        """Сохраняет QR-код в кэш"""
         if not self.config["enable_qr_caching"]:
             return
         
-        # Сохраняем в Redis
         if self.redis_client:
             try:
                 self.redis_client.setex(
@@ -591,7 +534,6 @@ class QRCodeManager:
             except:
                 pass
         
-        # Сохраняем в файл
         try:
             cache_path = os.path.join(self.config["cache_dir"], f"{key}.png")
             with open(cache_path, 'wb') as f:
@@ -600,7 +542,6 @@ class QRCodeManager:
             logger.error(f"❌ Ошибка сохранения в кэш: {e}")
     
     def scan_qr_image(self, image_bytes: bytes) -> Dict:
-        """Сканирует QR-код на изображении с улучшенной обработкой"""
         start_time = time.time()
         
         result = {
@@ -612,7 +553,6 @@ class QRCodeManager:
         }
         
         try:
-            # Конвертируем байты в изображение
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
@@ -620,10 +560,8 @@ class QRCodeManager:
                 result["error"] = "Не удалось прочитать изображение"
                 return result
             
-            # Улучшаем изображение для лучшего распознавания
             img = self._enhance_image_for_scan(img)
             
-            # Пробуем разные методы распознавания
             qr_data = self._decode_qr_multiple_methods(img)
             
             if qr_data:
@@ -653,25 +591,19 @@ class QRCodeManager:
         return result
     
     def _enhance_image_for_scan(self, img) -> np.ndarray:
-        """Улучшает изображение для распознавания QR-кодов"""
         try:
-            # Конвертируем в оттенки серого
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
-            # Увеличиваем контраст
             gray = cv2.equalizeHist(gray)
             
-            # Применяем адаптивный порог
             binary = cv2.adaptiveThreshold(
                 gray, 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY, 11, 2
             )
             
-            # Убираем шум
             denoised = cv2.medianBlur(binary, 3)
             
-            # Увеличиваем изображение для лучшего распознавания
             height, width = denoised.shape
             if width < 300 or height < 300:
                 scale = max(300 / width, 300 / height)
@@ -686,10 +618,7 @@ class QRCodeManager:
             return img
     
     def _decode_qr_multiple_methods(self, img) -> Optional[str]:
-        """Пробует несколько методов распознавания QR-кодов"""
-        
-        # Метод 1: pyzbar (основной)
-        if CV2_AVAILABLE:
+        if CV2_AVAILABLE and decode is not None:
             try:
                 decoded_objects = decode(img)
                 if decoded_objects:
@@ -697,7 +626,6 @@ class QRCodeManager:
             except Exception as e:
                 logger.debug(f"Pyzbar ошибка: {e}")
         
-        # Метод 2: OpenCV QRCodeDetector
         try:
             qr_detector = cv2.QRCodeDetector()
             retval, decoded_info, points, straight_qrcode = qr_detector.detectAndDecodeMulti(img)
@@ -706,12 +634,11 @@ class QRCodeManager:
         except Exception as e:
             logger.debug(f"OpenCV QR detector ошибка: {e}")
         
-        # Метод 3: Пробуем с бинаризацией Otsu
         try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
-            if CV2_AVAILABLE:
+            if CV2_AVAILABLE and decode is not None:
                 decoded_objects = decode(thresh)
                 if decoded_objects:
                     return decoded_objects[0].data.decode('utf-8')
@@ -721,7 +648,6 @@ class QRCodeManager:
         return None
     
     def check_scan_rate_limit(self, scanner_id: int, order_code: str) -> Tuple[bool, int]:
-        """Проверяет лимит сканирований для защиты от повторов"""
         key = f"{scanner_id}:{order_code}"
         current_time = time.time()
         
@@ -734,7 +660,6 @@ class QRCodeManager:
         return True, 0
     
     def get_stats(self) -> Dict:
-        """Возвращает статистику работы QR-менеджера"""
         with self.stats_lock:
             stats = dict(self.stats)
             stats["cache_hit_rate"] = 0
@@ -750,17 +675,14 @@ class QRCodeManager:
             return stats
     
     def clear_cache(self, older_than: int = None) -> int:
-        """Очищает кэш QR-кодов"""
         cleared = 0
         
         if self.redis_client:
             try:
-                # В Redis TTL сам удаляет
                 pass
             except:
                 pass
         
-        # Очищаем файловый кэш
         cache_dir = self.config["cache_dir"]
         if os.path.exists(cache_dir):
             current_time = time.time()
@@ -776,10 +698,8 @@ class QRCodeManager:
         logger.info(f"🧹 Очищено {cleared} файлов из кэша")
         return cleared
 
-# Инициализация QR менеджера
 qr_manager = QRCodeManager()
 
-# ========== ИМПОРТ ТЕЛЕГРАМ МОДУЛЕЙ ==========
 from telegram import (
     Update, 
     InlineKeyboardButton, 
@@ -799,22 +719,18 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 
-# ========== КЛАСС ДЛЯ РЕЙТ-ЛИМИТИНГА ==========
 class RateLimiter:
-    """Ограничитель частоты запросов"""
     def __init__(self, max_calls: int = 10, time_window: int = 5):
         self.user_requests = {}
         self.max_calls = max_calls
         self.time_window = time_window
     
     def check_limit(self, user_id: int) -> bool:
-        """Проверить, не превышен ли лимит запросов"""
         current_time = time.time()
         
         if user_id not in self.user_requests:
             self.user_requests[user_id] = []
         
-        # Удаляем старые запросы
         self.user_requests[user_id] = [
             req_time for req_time in self.user_requests[user_id]
             if current_time - req_time < self.time_window
@@ -827,13 +743,11 @@ class RateLimiter:
         return True
     
     def get_remaining(self, user_id: int) -> int:
-        """Получить оставшееся количество запросов"""
         current_time = time.time()
         
         if user_id not in self.user_requests:
             return self.max_calls
         
-        # Удаляем старые запросы
         self.user_requests[user_id] = [
             req_time for req_time in self.user_requests[user_id]
             if current_time - req_time < self.time_window
@@ -841,42 +755,31 @@ class RateLimiter:
         
         return self.max_calls - len(self.user_requests[user_id])
 
-# Инициализация рейт-лимитера
 rate_limiter = RateLimiter(max_calls=15, time_window=5)
 
-# ========== ФУНКЦИИ ДЛЯ БЕЗОПАСНОСТИ ==========
 def sanitize_input(text: str, max_length: int = 500) -> str:
-    """Очистка ввода от потенциально опасных символов"""
     if not text:
         return ""
     
-    # Экранируем HTML
     text = html.escape(text)
     
-    # Ограничиваем длину
     if len(text) > max_length:
         text = text[:max_length]
     
-    # Убираем лишние пробелы
     return text.strip()
 
 def validate_email(email: str) -> bool:
-    """Проверка валидности email"""
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return bool(re.match(pattern, email))
 
 def validate_name(name: str) -> bool:
-    """Проверка валидности имени"""
     if len(name) < 2 or len(name) > 100:
         return False
     
-    # Разрешаем буквы, пробелы, дефисы и апострофы
     pattern = r'^[a-zA-Zа-яА-ЯёЁ\s\-\'\.]+$'
     return bool(re.match(pattern, name))
 
-# ========== ФУНКЦИИ ДЛЯ ЛОГИРОВАНИЯ ==========
 async def send_log_to_channel(context: ContextTypes.DEFAULT_TYPE, message: str, level: str = "INFO"):
-    """Отправляет лог в канал"""
     try:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_message = f"[{timestamp}] [{level}] {message}"
@@ -893,20 +796,12 @@ async def send_log_to_channel(context: ContextTypes.DEFAULT_TYPE, message: str, 
         logger.error(f"Ошибка отправки лога в канал: {e}")
 
 def log_user_action(user_id: int, action: str, details: str = ""):
-    """Логирование действий пользователей"""
     try:
         user_logger.info(f"User {user_id} - {action} - {details}")
     except Exception as e:
         logger.error(f"Ошибка логирования действия пользователя: {e}")
 
 def log_qr_action(action: str, details: Dict = None):
-    """
-    Логирование действий с QR-кодами
-    
-    Args:
-        action: Действие (generate, scan, verify, error)
-        details: Детали операции
-    """
     try:
         log_entry = {
             "timestamp": datetime.now().isoformat(),
@@ -917,41 +812,31 @@ def log_qr_action(action: str, details: Dict = None):
     except Exception as e:
         logger.error(f"Ошибка логирования QR-действия: {e}")
 
-# ========== ФУНКЦИИ ДЛЯ ГЕНЕРАЦИИ УНИКАЛЬНЫХ КОДОВ ==========
 def generate_unique_code(length: int = 6) -> str:
-    """Генерирует уникальный код для заказа в формате #KA123456"""
     characters = string.digits
     while True:
         numbers = ''.join(random.choices(characters, k=length))
         code = f"#KA{numbers}"
-        # Проверка уникальности будет в базе данных
         return code
 
 def format_code_for_display(code: str) -> str:
-    """Форматирует код для отображения"""
     return code
 
-# ========== КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ SQLite ==========
 class Database:
-    """Класс для работы с SQLite базой данных"""
-    
     def __init__(self, db_file: str = DB_FILE):
         self.db_file = db_file
         self.init_database()
         self.check_and_fix_database()
     
     def get_connection(self):
-        """Получить соединение с базой данных"""
         conn = sqlite3.connect(self.db_file, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
     
     def init_database(self):
-        """Инициализация таблиц базы данных"""
         with closing(self.get_connection()) as conn:
             cursor = conn.cursor()
             
-            # Настройки мероприятия
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS event_settings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -961,7 +846,6 @@ class Database:
                 )
             """)
             
-            # Пользователи бота
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS bot_users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -979,7 +863,6 @@ class Database:
                 )
             """)
             
-            # Заказы
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -999,14 +882,13 @@ class Database:
                     closed_at TIMESTAMP,
                     notified_promoters BOOLEAN DEFAULT FALSE,
                     processed_at TIMESTAMP,
-                    scanned_at TIMESTAMP,  -- Время сканирования QR-кода
-                    scanned_by VARCHAR(100),  -- Кто сканировал
-                    qr_hash VARCHAR(64),  -- Хэш для кэширования
-                    qr_version VARCHAR(10)  -- Версия QR формата
+                    scanned_at TIMESTAMP,
+                    scanned_by VARCHAR(100),
+                    qr_hash VARCHAR(64),
+                    qr_version VARCHAR(10)
                 )
             """)
             
-            # Гости
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS guests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1014,18 +896,17 @@ class Database:
                     order_code VARCHAR(20) NOT NULL,
                     guest_number INTEGER NOT NULL,
                     full_name VARCHAR(200) NOT NULL,
-                    guest_hash VARCHAR(64),  -- Хэш имени для приватности
+                    guest_hash VARCHAR(64),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    scanned_at TIMESTAMP,  -- Время сканирования QR-кода для каждого гостя
-                    scanned_by VARCHAR(100),  -- Кто сканировал
-                    scan_attempts INTEGER DEFAULT 0,  -- Количество попыток сканирования
-                    last_scan_attempt TIMESTAMP,  -- Последняя попытка сканирования
+                    scanned_at TIMESTAMP,
+                    scanned_by VARCHAR(100),
+                    scan_attempts INTEGER DEFAULT 0,
+                    last_scan_attempt TIMESTAMP,
                     FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
                     UNIQUE(order_id, guest_number)
                 )
             """)
             
-            # Промокоды
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS promo_codes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1041,7 +922,6 @@ class Database:
                 )
             """)
             
-            # Логи действий
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS action_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1052,7 +932,6 @@ class Database:
                 )
             """)
             
-            # Логи сканирования QR-кодов
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS scan_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1063,15 +942,14 @@ class Database:
                     guest_hash VARCHAR(64),
                     scan_result VARCHAR(20),
                     scan_message TEXT,
-                    scan_time_ms INTEGER,  -- Время сканирования в миллисекундах
-                    qr_version VARCHAR(10),  -- Версия QR формата
-                    signature_valid BOOLEAN,  -- Была ли подпись валидной
-                    timestamp_valid BOOLEAN,  -- Была ли временная метка валидной
+                    scan_time_ms INTEGER,
+                    qr_version VARCHAR(10),
+                    signature_valid BOOLEAN,
+                    timestamp_valid BOOLEAN,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # Таблица для отслеживания попыток сканирования (защита от DDoS)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS scan_attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1083,7 +961,6 @@ class Database:
                 )
             """)
             
-            # Статистика кэширования QR-кодов
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS qr_cache_stats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1095,7 +972,6 @@ class Database:
                 )
             """)
             
-            # Индексы
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(order_code)")
@@ -1118,7 +994,6 @@ class Database:
             logger.info("✅ Таблицы SQLite базы данных инициализированы")
     
     def add_column_if_not_exists(self, table_name: str, column_name: str, column_type: str):
-        """Добавить колонку в таблицу если она не существует"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1127,14 +1002,10 @@ class Database:
                 column_names = [col[1] for col in columns]
                 
                 if column_name not in column_names:
-                    # Для SQLite мы не можем добавить колонку с DEFAULT CURRENT_TIMESTAMP
-                    # Поэтому добавляем колонку без дефолта, а потом обновляем значения
                     if "DEFAULT CURRENT_TIMESTAMP" in column_type.upper():
-                        # Добавляем как обычный TIMESTAMP
                         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} TIMESTAMP")
                         conn.commit()
                         
-                        # Обновляем существующие записи
                         cursor.execute(f"UPDATE {table_name} SET {column_name} = CURRENT_TIMESTAMP WHERE {column_name} IS NULL")
                         conn.commit()
                     else:
@@ -1149,10 +1020,8 @@ class Database:
             return False
     
     def check_and_fix_database(self):
-        """Проверить и исправить структуру базы данных"""
         logger.info("🔧 Проверка структуры базы данных...")
         
-        # Добавляем колонки по очереди
         self.add_column_if_not_exists("orders", "ticket_type", "VARCHAR(10) DEFAULT 'standard'")
         self.add_column_if_not_exists("bot_users", "notified_about_restart", "BOOLEAN DEFAULT FALSE")
         self.add_column_if_not_exists("orders", "notified_promoters", "BOOLEAN DEFAULT FALSE")
@@ -1176,9 +1045,7 @@ class Database:
         
         logger.info("✅ Структура базы данных проверена")
     
-    # ========== МЕТОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ==========
     def add_user(self, user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-        """Добавить/обновить пользователя"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1200,7 +1067,6 @@ class Database:
             return False
     
     def update_user_request(self, user_id: int):
-        """Обновить счетчик запросов пользователя"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1218,7 +1084,6 @@ class Database:
             return False
     
     def mark_user_notified(self, user_id: int):
-        """Пометить пользователя как уведомленного о перезапуске"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1234,7 +1099,6 @@ class Database:
             return False
     
     def reset_notification_status(self):
-        """Сбросить статус уведомлений для всех пользователей"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1247,7 +1111,6 @@ class Database:
             return False
     
     def get_users_to_notify(self) -> List[Dict]:
-        """Получить пользователей для уведомления о перезапуске"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1263,7 +1126,6 @@ class Database:
             return []
     
     def _get_user_role(self, user_id: int) -> str:
-        """Определить роль пользователя"""
         if user_id in ADMIN_IDS:
             return "admin"
         elif user_id in PROMOTER_IDS:
@@ -1272,7 +1134,6 @@ class Database:
             return "user"
     
     def get_user(self, user_id: int) -> Optional[Dict]:
-        """Получить информацию о пользователе"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1284,7 +1145,6 @@ class Database:
             return None
     
     def get_all_users(self) -> List[Dict]:
-        """Получить всех пользователей"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1296,7 +1156,6 @@ class Database:
             return []
     
     def get_promoters(self) -> List[Dict]:
-        """Получить всех промоутеров"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1308,18 +1167,15 @@ class Database:
             return []
     
     def get_scanners(self) -> List[Dict]:
-        """Получить всех пользователей с правом сканирования QR-кодов"""
         try:
             scanners = []
-            # Добавляем администраторов
             for admin_id in ADMIN_IDS:
                 user = self.get_user(admin_id)
                 if user:
                     scanners.append(user)
             
-            # Добавляем промоутеров
             for promoter_id in PROMOTER_IDS:
-                if promoter_id not in ADMIN_IDS:  # Избегаем дублирования
+                if promoter_id not in ADMIN_IDS:
                     user = self.get_user(promoter_id)
                     if user:
                         scanners.append(user)
@@ -1330,7 +1186,6 @@ class Database:
             return []
     
     def get_top_users(self, limit: int = 10) -> List[Dict]:
-        """Получить самых активных пользователей"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1347,10 +1202,8 @@ class Database:
             logger.error(f"❌ Ошибка получения топ пользователей: {e}")
             return []
     
-    # ========== МЕТОДЫ ДЛЯ ЗАКАЗОВ ==========
     def create_order(self, user_id: int, username: str, user_name: str, 
                     user_email: str, group_size: int, ticket_type: str, total_amount: int) -> Dict:
-        """Создать новый заказ с уникальным кодом"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1359,9 +1212,7 @@ class Database:
                 max_id = cursor.fetchone()[0] or 999
                 order_id = f"SP{max_id + 1}"
                 
-                # Генерируем уникальный код
                 order_code = generate_unique_code()
-                # Проверяем уникальность
                 while self.get_order_by_code(order_code):
                     order_code = generate_unique_code()
                 
@@ -1394,7 +1245,6 @@ class Database:
             return None
     
     def mark_order_notified(self, order_id: str):
-        """Пометить заказ как уведомленный для промоутеров"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1410,7 +1260,6 @@ class Database:
             return False
     
     def mark_order_processed(self, order_id: str):
-        """Пометить заказ как обработанный"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1426,7 +1275,6 @@ class Database:
             return False
     
     def get_unnotified_orders(self) -> List[Dict]:
-        """Получить заказы, по которым не отправлялись уведомления промоутерам"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1443,7 +1291,6 @@ class Database:
             return []
     
     def get_old_unprocessed_orders(self, hours: int = 1) -> List[Dict]:
-        """Получить заказы, которые активны более указанного времени"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1461,13 +1308,11 @@ class Database:
             return []
     
     def add_guests_to_order(self, order_id: str, order_code: str, guests: List[str]):
-        """Добавить гостей к заказу"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 
                 for i, guest_name in enumerate(guests, 1):
-                    # Генерируем хэш гостя для приватности
                     guest_hash = hashlib.md5(guest_name.encode()).hexdigest()[:8] if guest_name else None
                     
                     cursor.execute("""
@@ -1483,7 +1328,6 @@ class Database:
             return False
     
     def get_order(self, order_id: str) -> Optional[Dict]:
-        """Получить заказ по ID"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1495,7 +1339,6 @@ class Database:
             return None
     
     def get_order_by_code(self, order_code: str) -> Optional[Dict]:
-        """Получить заказ по коду"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1507,7 +1350,6 @@ class Database:
             return None
     
     def get_user_orders(self, user_id: int) -> List[Dict]:
-        """Получить заказы пользователя"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1519,7 +1361,6 @@ class Database:
             return []
     
     def get_orders_by_status(self, status: str) -> List[Dict]:
-        """Получить заказы по статусу"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1531,7 +1372,6 @@ class Database:
             return []
     
     def update_order_status(self, order_id: str, status: str, promoter_username: str = None) -> bool:
-        """Обновить статус заказа"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1564,7 +1404,6 @@ class Database:
             return False
     
     def mark_ticket_scanned(self, order_code: str, scanner_id: int, scanner_username: str, guest_name: str = None) -> bool:
-        """Отметить билет как использованный (отсканированный)"""
         log_details = {
             "order_code": order_code,
             "scanner_id": scanner_id,
@@ -1579,12 +1418,10 @@ class Database:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 
-                # Проверяем, не был ли билет уже отсканирован
                 cursor.execute("SELECT scanned_at, scanned_by FROM orders WHERE order_code = ?", (order_code,))
                 result = cursor.fetchone()
                 
                 if result and result[0] is not None:
-                    # Билет уже был отсканирован
                     logger.warning(f"⚠️ Билет {order_code} уже был отсканирован {result[0]} пользователем {result[1]}")
                     log_details["already_scanned"] = {
                         "scanned_at": str(result[0]),
@@ -1593,7 +1430,6 @@ class Database:
                     log_details["success"] = False
                     log_qr_action("scan_already_used", log_details)
                     
-                    # Увеличиваем счетчик попыток сканирования для гостя
                     if guest_name:
                         cursor.execute("""
                             UPDATE guests 
@@ -1605,7 +1441,6 @@ class Database:
                     
                     return False
                 
-                # Отмечаем заказ как отсканированный
                 cursor.execute("""
                     UPDATE orders 
                     SET scanned_at = CURRENT_TIMESTAMP, 
@@ -1616,7 +1451,6 @@ class Database:
                 order_updated = cursor.rowcount > 0
                 log_details["order_updated"] = order_updated
                 
-                # Если указан конкретный гость, отмечаем его
                 if guest_name:
                     cursor.execute("""
                         UPDATE guests 
@@ -1630,7 +1464,6 @@ class Database:
                     guest_updated = cursor.rowcount > 0
                     log_details["guest_updated"] = guest_updated
                 else:
-                    # Если гость не указан, отмечаем всех гостей этого заказа
                     cursor.execute("""
                         UPDATE guests 
                         SET scanned_at = CURRENT_TIMESTAMP, 
@@ -1667,7 +1500,6 @@ class Database:
             return False
     
     def update_order_qr_data(self, order_id: str, qr_hash: str, qr_version: str) -> bool:
-        """Обновляет данные QR-кода для заказа"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1683,7 +1515,6 @@ class Database:
             return False
     
     def update_guest_hash(self, order_code: str, guest_name: str, guest_hash: str) -> bool:
-        """Обновляет хэш гостя"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1702,7 +1533,6 @@ class Database:
                  guest_name: str, result: str, message: str, scan_time_ms: int = None,
                  guest_hash: str = None, qr_version: str = None,
                  signature_valid: bool = None, timestamp_valid: bool = None):
-        """Логировать сканирование QR-кода с расширенными данными"""
         log_details = {
             "scanner_id": scanner_id,
             "scanner_username": scanner_username,
@@ -1737,7 +1567,6 @@ class Database:
             return False
     
     def record_scan_attempt(self, scanner_id: int, order_code: str, success: bool) -> bool:
-        """Записывает попытку сканирования"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1752,7 +1581,6 @@ class Database:
             return False
     
     def get_scan_attempts_count(self, scanner_id: int, minutes: int = 5) -> int:
-        """Получает количество попыток сканирования за последние N минут"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1768,7 +1596,6 @@ class Database:
             return 0
     
     def get_scan_stats(self) -> Dict:
-        """Получить статистику сканирований"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1803,14 +1630,12 @@ class Database:
                 cursor.execute("SELECT COUNT(*) FROM orders WHERE status = 'closed'")
                 total_valid_tickets = cursor.fetchone()[0] or 0
                 
-                # Статистика за сегодня
                 cursor.execute("SELECT COUNT(*) FROM scan_logs WHERE DATE(created_at) = DATE('now')")
                 today_scans = cursor.fetchone()[0] or 0
                 
                 cursor.execute("SELECT COUNT(*) FROM scan_logs WHERE DATE(created_at) = DATE('now') AND scan_result = 'success'")
                 today_success = cursor.fetchone()[0] or 0
                 
-                # Статистика по часам
                 cursor.execute("""
                     SELECT 
                         strftime('%H', created_at) as hour,
@@ -1822,7 +1647,6 @@ class Database:
                 """)
                 hourly_stats = cursor.fetchall()
                 
-                # Последние сканирования
                 cursor.execute("""
                     SELECT 
                         scanner_username, 
@@ -1867,12 +1691,10 @@ class Database:
             return {}
     
     def get_qr_statistics(self) -> Dict:
-        """Получает расширенную статистику по QR-кодам"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 
-                # Статистика сканирований
                 cursor.execute("""
                     SELECT 
                         COUNT(*) as total_scans,
@@ -1884,7 +1706,6 @@ class Database:
                 """)
                 row = cursor.fetchone()
                 
-                # Статистика по часам
                 cursor.execute("""
                     SELECT 
                         strftime('%H', created_at) as hour,
@@ -1896,7 +1717,6 @@ class Database:
                 """)
                 hourly_stats = cursor.fetchall()
                 
-                # Топ сканеров
                 cursor.execute("""
                     SELECT 
                         scanner_username,
@@ -1909,7 +1729,6 @@ class Database:
                 """)
                 top_scanners = cursor.fetchall()
                 
-                # Статистика по билетам
                 cursor.execute("""
                     SELECT 
                         COUNT(*) as total_tickets,
@@ -1919,7 +1738,6 @@ class Database:
                 """)
                 tickets_row = cursor.fetchone()
                 
-                # Последние сканирования
                 cursor.execute("""
                     SELECT 
                         scanner_username,
@@ -1935,7 +1753,6 @@ class Database:
                 """)
                 recent_scans = cursor.fetchall()
                 
-                # Кэш статистика
                 cursor.execute("""
                     SELECT 
                         COUNT(*) as total_cache_ops,
@@ -1983,7 +1800,6 @@ class Database:
             return {}
     
     def log_qr_cache(self, action: str, cache_key: str, cache_hit: bool, gen_time_ms: int):
-        """Логирует использование кэша QR-кодов"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -1996,7 +1812,6 @@ class Database:
             logger.error(f"❌ Ошибка логирования кэша: {e}")
     
     def get_recent_scan_attempts(self, scanner_id: int, limit: int = 10) -> List[Dict]:
-        """Получает последние попытки сканирования сканера"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2013,7 +1828,6 @@ class Database:
             return []
     
     def get_order_guests(self, order_id: str) -> List[Dict]:
-        """Получить гостей заказа"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2025,7 +1839,6 @@ class Database:
             return []
     
     def get_all_guests_count(self) -> int:
-        """Получить общее количество гостей"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2037,7 +1850,6 @@ class Database:
             return 0
     
     def reset_guests_count(self) -> bool:
-        """Сбросить счетчик гостей (удалить всех гостей)"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2049,9 +1861,7 @@ class Database:
             logger.error(f"❌ Ошибка сброса счетчика гостей: {e}")
             return False
     
-    # ========== МЕТОДЫ ДЛЯ НАСТРОЕК ==========
     def get_setting(self, key: str, default: Any = None) -> Any:
-        """Получить значение настройки"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2069,7 +1879,6 @@ class Database:
             return default
     
     def set_setting(self, key: str, value: Any) -> bool:
-        """Установить значение настройки"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2090,14 +1899,11 @@ class Database:
             logger.error(f"❌ Ошибка установки настройки {key}: {e}")
             return False
     
-    # ========== МЕТОДЫ ДЛЯ СТАТИСТИКИ ==========
     def get_statistics(self) -> Dict:
-        """Получить статистику"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
                 
-                # Основная статистика
                 cursor.execute("SELECT COUNT(*) FROM orders")
                 total_orders = cursor.fetchone()[0] or 0
                 
@@ -2130,7 +1936,6 @@ class Database:
                 cursor.execute("SELECT COALESCE(SUM(total_amount), 0) FROM orders WHERE ticket_type = 'standard' AND status = 'closed'")
                 standard_revenue = cursor.fetchone()[0] or 0
                 
-                # Статистика за сегодня
                 cursor.execute("SELECT COUNT(*) FROM orders WHERE DATE(created_at) = DATE('now')")
                 today_orders = cursor.fetchone()[0] or 0
                 
@@ -2140,7 +1945,6 @@ class Database:
                 cursor.execute("SELECT COUNT(DISTINCT user_id) FROM orders WHERE DATE(created_at) = DATE('now')")
                 today_users = cursor.fetchone()[0] or 0
                 
-                # Статистика за неделю
                 cursor.execute("""
                     SELECT 
                         DATE(created_at) as date,
@@ -2161,7 +1965,6 @@ class Database:
                         "revenue": row[2] or 0
                     })
                 
-                # Топ промоутеров
                 cursor.execute("""
                     SELECT closed_by, COUNT(*) as closed_count, SUM(total_amount) as total_revenue
                     FROM orders 
@@ -2202,10 +2005,8 @@ class Database:
             logger.error(f"❌ Ошибка получения статистики: {e}")
             return {}
     
-    # ========== МЕТОДЫ ДЛЯ ПРОМОКОДОВ ==========
     def create_promo_code(self, code: str, discount_type: str, discount_value: int, 
                          max_uses: int = 1, valid_until: str = None, created_by: str = None) -> bool:
-        """Создать промокод"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2225,7 +2026,6 @@ class Database:
             return False
     
     def get_promo_code(self, code: str) -> Optional[Dict]:
-        """Получить промокод"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2237,7 +2037,6 @@ class Database:
             return None
     
     def apply_promo_code(self, code: str, order_amount: int) -> Dict:
-        """Применить промокод"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2256,16 +2055,14 @@ class Database:
                 
                 promo_dict = dict(promo)
                 
-                # Применяем скидку
                 discount = 0
                 if promo_dict['discount_type'] == 'percent':
                     discount = order_amount * promo_dict['discount_value'] / 100
-                else:  # fixed
+                else:
                     discount = min(promo_dict['discount_value'], order_amount)
                 
                 final_amount = order_amount - discount
                 
-                # Увеличиваем счетчик использования
                 cursor.execute("""
                     UPDATE promo_codes 
                     SET used_count = used_count + 1 
@@ -2291,7 +2088,6 @@ class Database:
             return {"success": False, "error": str(e)}
     
     def deactivate_promo_code(self, code: str) -> bool:
-        """Деактивировать промокод"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2313,7 +2109,6 @@ class Database:
             return False
     
     def get_all_promo_codes(self) -> List[Dict]:
-        """Получить все промокоды"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2324,9 +2119,7 @@ class Database:
             logger.error(f"❌ Ошибка получения промокодов: {e}")
             return []
     
-    # ========== МЕТОДЫ ДЛЯ ЛОГИРОВАНИЯ ДЕЙСТВИЙ ==========
     def log_action(self, user_id: int, action_type: str, action_details: str = None):
-        """Записать действие в лог"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2343,7 +2136,6 @@ class Database:
             return False
     
     def get_recent_actions(self, limit: int = 50) -> List[Dict]:
-        """Получить последние действия"""
         try:
             with closing(self.get_connection()) as conn:
                 cursor = conn.cursor()
@@ -2360,10 +2152,7 @@ class Database:
             logger.error(f"❌ Ошибка получения действий: {e}")
             return []
 
-# ========== КЛАСС ДЛЯ ХРАНЕНИЯ НАСТРОЕК ==========
 class EventSettings:
-    """Класс для хранения и управления настройками мероприятия"""
-    
     DEFAULT_SETTINGS = {
         "event_name": "SMILE PARTY 🎉",
         "event_date": "25 декабря 2024",
@@ -2384,14 +2173,12 @@ class EventSettings:
         self._load_defaults()
     
     def _load_defaults(self):
-        """Загрузить настройки по умолчанию в базу данных"""
         for key, value in self.DEFAULT_SETTINGS.items():
             current = self.db.get_setting(key)
             if current is None:
                 self.db.set_setting(key, value)
     
     def get_all_settings(self) -> Dict:
-        """Получить все настройки"""
         settings = {}
         for key in self.DEFAULT_SETTINGS.keys():
             value = self.db.get_setting(key)
@@ -2402,23 +2189,18 @@ class EventSettings:
         return settings
     
     def get_price_standard(self) -> int:
-        """Получить стандартную цену"""
         return self.db.get_setting("price_standard", 450)
     
     def get_price_group(self) -> int:
-        """Получить групповую цену"""
         return self.db.get_setting("price_group", 350)
     
     def get_price_vip(self) -> int:
-        """Получить VIP цену"""
         return self.db.get_setting("price_vip", 650)
     
     def get_group_threshold(self) -> int:
-        """Получить порог для групповой цены"""
         return self.db.get_setting("group_threshold", 5)
     
     def calculate_price(self, group_size: int, ticket_type: str = "standard") -> int:
-        """Рассчитать стоимость"""
         if ticket_type == "vip":
             return group_size * self.get_price_vip()
         elif group_size >= self.get_group_threshold():
@@ -2427,25 +2209,21 @@ class EventSettings:
             return group_size * self.get_price_standard()
     
     def update_setting(self, key: str, value: Any) -> bool:
-        """Обновить настройку"""
         if key in self.DEFAULT_SETTINGS:
             return self.db.set_setting(key, value)
         return False
     
     def reset_to_defaults(self) -> bool:
-        """Сбросить настройки к значениям по умолчанию"""
         success = True
         for key, value in self.DEFAULT_SETTINGS.items():
             if not self.db.set_setting(key, value):
                 success = False
         return success
 
-# ========== ИНИЦИАЛИЗАЦИЯ ==========
 db = Database(DB_FILE)
 db.check_and_fix_database()
 event_settings = EventSettings(db)
 
-# Состояния
 (
     ROLE_SELECTION,
     MAIN_MENU,
@@ -2470,13 +2248,10 @@ event_settings = EventSettings(db)
     SCAN_RESULT
 ) = range(21)
 
-# ========== ПОМОЩНИКИ ==========
 def safe_markdown_text(text: str) -> str:
-    """Безопасное форматирование текста для Markdown"""
     if not text:
         return ""
     
-    # Экранируем специальные символы Markdown V2
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     
     result = ''
@@ -2489,7 +2264,6 @@ def safe_markdown_text(text: str) -> str:
     return result
 
 def escape_markdown(text: str) -> str:
-    """Экранирует специальные символы Markdown V2"""
     if not text:
         return ""
     
@@ -2505,7 +2279,6 @@ def escape_markdown(text: str) -> str:
     return result
 
 def get_user_role(user_id: int) -> str:
-    """Определить роль пользователя"""
     if user_id in ADMIN_IDS:
         return "admin"
     elif user_id in PROMOTER_IDS:
@@ -2514,17 +2287,13 @@ def get_user_role(user_id: int) -> str:
         return "user"
 
 def is_valid_email(email: str) -> bool:
-    """Проверяет валидность email"""
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return bool(re.match(pattern, email))
 
 def is_own_order(order: Dict, user_id: int) -> bool:
-    """Проверяет, является ли заказ собственным для пользователя"""
     return order["user_id"] == user_id
 
-# ========== ФУНКЦИИ ДЛЯ УВЕДОМЛЕНИЙ ==========
 async def send_channel_notification(context: ContextTypes.DEFAULT_TYPE, order: Dict, promoter_username: str, action: str):
-    """Отправить уведомление в канал с уникальным кодом"""
     try:
         formatted_code = format_code_for_display(order['order_code'])
         
@@ -2580,7 +2349,6 @@ async def send_channel_notification(context: ContextTypes.DEFAULT_TYPE, order: D
         logger.error(f"Ошибка отправки уведомления в канал: {e}")
 
 async def send_to_lists_channel(context: ContextTypes.DEFAULT_TYPE, order: Dict, promoter_username: str):
-    """Отправить информацию в канал со списками"""
     try:
         guests = db.get_order_guests(order['order_id'])
         closed_time = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
@@ -2629,7 +2397,6 @@ async def send_to_lists_channel(context: ContextTypes.DEFAULT_TYPE, order: Dict,
         logger.error(f"Ошибка отправки информации в канал списков: {e}")
 
 async def send_new_order_notification(context: ContextTypes.DEFAULT_TYPE, order: Dict):
-    """Отправить уведомление о новом заказе в чат промоутеров"""
     try:
         guests = db.get_order_guests(order['order_id'])
         
@@ -2680,7 +2447,6 @@ async def send_new_order_notification(context: ContextTypes.DEFAULT_TYPE, order:
         
         text += f"\n• Email: {user_email}"
         
-        # Создаем ссылку для обработки заявки в боте
         bot_username = context.bot.username
         bot_link = f"https://t.me/{bot_username}?start=order_{order['order_id']}"
         
@@ -2707,7 +2473,6 @@ async def send_new_order_notification(context: ContextTypes.DEFAULT_TYPE, order:
         logger.error(f"Ошибка при формировании уведомления о новом заказе: {e}")
 
 async def check_and_send_notifications(context: ContextTypes.DEFAULT_TYPE):
-    """Проверить и отправить уведомления о новых заказах"""
     try:
         unnotified_orders = db.get_unnotified_orders()
         
@@ -2722,16 +2487,14 @@ async def check_and_send_notifications(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при проверке и отправке уведомлений: {e}")
 
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Отправка напоминаний о необработанных заказах"""
     try:
-        # Находим заказы, которые активны более 1 часа
         old_orders = db.get_old_unprocessed_orders(hours=1)
         
         if old_orders:
             reminder_text = "⏰ *НАПОМИНАНИЕ!*\n\n"
             reminder_text += f"Следующие заказы активны более 1 часа:\n\n"
             
-            for order in old_orders[:5]:  # Ограничиваем 5 заказами
+            for order in old_orders[:5]:
                 reminder_text += f"• Заказ #{order['order_id']} ({order['order_code']}) - {order['user_name']}\n"
             
             if len(old_orders) > 5:
@@ -2739,7 +2502,6 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
             
             reminder_text += "\nПожалуйста, обработайте эти заказы как можно скорее!"
             
-            # Отправляем напоминание в чат промоутеров
             try:
                 await context.bot.send_message(
                     chat_id=PROMOTERS_CHAT_ID,
@@ -2754,7 +2516,6 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в send_reminders: {e}")
 
 async def send_order_notification_to_user(context: ContextTypes.DEFAULT_TYPE, order: Dict, action: str, promoter_username: str):
-    """Отправить уведомление пользователю о действии с его заказом"""
     try:
         if order['user_id']:
             escaped_promoter = escape_markdown(promoter_username)
@@ -2777,7 +2538,6 @@ async def send_order_notification_to_user(context: ContextTypes.DEFAULT_TYPE, or
                     f"Спасибо за покупку! Ждем вас на мероприятии! 🎉"
                 )
                 
-                # Добавляем кнопку для получения QR-кода
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton("🎫 Получить QR-код билета", callback_data=f"get_qr_{order['order_id']}")]
                 ])
@@ -2809,11 +2569,7 @@ async def send_order_notification_to_user(context: ContextTypes.DEFAULT_TYPE, or
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления пользователю: {e}")
 
-# ========== ФУНКЦИИ ДЛЯ QR-КОДОВ ==========
 async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE, order_code: str):
-    """
-    Генерирует и отправляет QR-код для билета с использованием QRManager
-    """
     start_time = time.time()
     
     log_details = {
@@ -2862,10 +2618,8 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 )
             return
         
-        # Получаем список гостей
         guests = db.get_order_guests(order['order_id'])
         
-        # Вычисляем хэш для кэширования
         qr_hash = hashlib.md5(f"{order_code}_{order.get('ticket_type', 'standard')}".encode()).hexdigest()
         db.update_order_qr_data(order['order_id'], qr_hash, QR_CONFIG["version"])
         
@@ -2875,23 +2629,20 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
             for i, guest in enumerate(guests, 1):
                 guest_name = guest['full_name']
                 
-                # Генерируем хэш гостя
                 guest_hash = hashlib.md5(guest_name.encode()).hexdigest()[:8]
                 db.update_guest_hash(order_code, guest_name, guest_hash)
                 
-                # Генерируем QR-код через менеджер
                 qr_bytes = qr_manager.generate_qr_image(
                     order_code,
                     order.get('ticket_type', 'standard'),
                     guest_name
                 )
                 
-                # Логируем использование кэша
                 cache_key = hashlib.md5(f"{order_code}_{guest_name}".encode()).hexdigest()
                 db.log_qr_cache(
                     "generate",
                     cache_key,
-                    False,  # В реальности нужно проверять был ли в кэше
+                    False,
                     int((time.time() - start_time) * 1000)
                 )
                 
@@ -2919,7 +2670,6 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 
                 await asyncio.sleep(0.5)
         else:
-            # Если гостей нет, генерируем один QR-код
             qr_bytes = qr_manager.generate_qr_image(
                 order_code,
                 order.get('ticket_type', 'standard')
@@ -2966,7 +2716,6 @@ async def generate_ticket_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
 
 async def scan_qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для сканирования QR-кодов"""
     user = update.effective_user
     
     logger.info(f"📱 Пользователь {user.id} (@{user.username}) вызвал команду scan_qr")
@@ -2991,9 +2740,6 @@ async def scan_qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SCAN_QR
 
 async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает сканирование QR-кода с улучшенной защитой
-    """
     user = update.effective_user
     username = user.username or f"user_{user.id}"
     start_time = time.time()
@@ -3015,9 +2761,8 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return MAIN_MENU
     
-    # Проверяем лимит попыток (защита от DDoS)
-    attempts = db.get_scan_attempts_count(user.id, 5)  # за последние 5 минут
-    if attempts > 20:  # максимум 20 попыток за 5 минут
+    attempts = db.get_scan_attempts_count(user.id, 5)
+    if attempts > 20:
         logger.warning(f"⚠️ Пользователь {user.id} превысил лимит попыток сканирования")
         await update.message.reply_text(
             "⏰ *Слишком много попыток сканирования!*\n\n"
@@ -3047,7 +2792,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(tmp_path, 'rb') as f:
                     image_bytes = f.read()
                 
-                # Используем QR Manager для сканирования
                 scan_result = qr_manager.scan_qr_image(image_bytes)
                 
                 if scan_result["success"]:
@@ -3067,12 +2811,11 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scan_log_details["input_text"] = text
             logger.info(f"📝 Получен текст для обработки: {text}")
             
-            # Ищем код в тексте (поддержка разных форматов)
             code_patterns = [
-                r'#?KA\d{6}',  # Основной формат
-                r'KA\d{6}',     # Без #
-                r'\d{6}',        # Только цифры
-                r'SMILE_PARTY:.*'  # Полные данные QR
+                r'#?KA\d{6}',
+                r'KA\d{6}',
+                r'\d{6}',
+                r'SMILE_PARTY:.*'
             ]
             
             for pattern in code_patterns:
@@ -3084,14 +2827,11 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             
             if not qr_data:
-                # Пробуем распознать как полный QR-формат
                 scan_result = {"success": True, "data": text}
                 qr_data = text
         
         if qr_data:
-            # Проверяем, является ли это полными данными QR или просто кодом
             if ':' in qr_data:
-                # Полные данные QR, парсим их
                 parsed = qr_manager.parse_qr_data(qr_data)
                 scan_log_details["parsed"] = parsed
                 
@@ -3130,11 +2870,9 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ticket_type = parsed.get("ticket_type", "standard")
                 guest_hash = parsed.get("guest_hash")
             else:
-                # Просто код, ищем в базе
                 code = qr_data.replace('#', '').strip()
                 parsed = {"valid": True, "code": code}
             
-            # Проверяем rate limit для этого билета
             rate_ok, wait_time = qr_manager.check_scan_rate_limit(user.id, code)
             if not rate_ok:
                 logger.warning(f"⚠️ Rate limit для билета {code}, сканер {user.id}")
@@ -3164,7 +2902,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 return SCAN_RESULT
             
-            # Проверяем код в базе
             order = db.get_order_by_code(code)
             
             if not order:
@@ -3198,9 +2935,7 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 logger.warning(f"⚠️ Билет {code} уже был использован {scanned_time}")
                 
-                # Проверяем, не пытаются ли сканировать снова слишком часто
                 if order.get('scanned_by') == username:
-                    # Тот же сканер пытается сканировать повторно
                     result_text = (
                         f"⚠️ *Билет уже был отсканирован ВАМИ!*\n\n"
                         f"🔑 Код: `{code}`\n"
@@ -3230,7 +2965,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 logger.info(f"✅ Билет {code} найден и готов к сканированию")
                 
-                # Проверяем совпадение хэша гостя если есть
                 guest_match = True
                 guest_name = None
                 
@@ -3259,7 +2993,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     db.record_scan_attempt(user.id, code, False)
                 else:
-                    # Отмечаем билет как использованный
                     success = db.mark_ticket_scanned(code, user.id, username, guest_name)
                     
                     if success:
@@ -3270,7 +3003,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if guests:
                             guest_list = "\n".join([f"• {escape_markdown(g['full_name'])}" for g in guests])
                             
-                            # Отмечаем конкретного гостя если был хэш
                             scanned_guest_marker = ""
                             if guest_name:
                                 scanned_guest_marker = f"\n✅ Отсканирован гость: {escape_markdown(guest_name)}"
@@ -3306,7 +3038,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         db.record_scan_attempt(user.id, code, True)
                         
-                        # Отправляем уведомление в канал логов
                         await send_log_to_channel(
                             context,
                             f"✅ QR-код отсканирован: {code} - гость: {guest_name or 'не указан'} - сканер: @{username}",
@@ -3327,7 +3058,6 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         db.record_scan_attempt(user.id, code, False)
             
-            # Создаем клавиатуру для продолжения
             keyboard = [
                 [InlineKeyboardButton("📱 Сканировать еще", callback_data="scan_qr_start")],
                 [InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_menu")]
@@ -3370,12 +3100,9 @@ async def handle_qr_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SCAN_QR
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик фотографий с QR-кодами"""
-    # Перенаправляем в общий обработчик QR-кодов
     return await handle_qr_scan(update, context)
 
 async def scan_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для просмотра статистики сканирований"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS + SCANNER_IDS:
@@ -3419,7 +3146,6 @@ async def scan_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def qr_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для просмотра расширенной статистики QR-кодов"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -3485,7 +3211,7 @@ async def qr_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if stats.get('hourly_stats'):
         text += "\n📅 *АКТИВНОСТЬ ПО ЧАСАМ:*\n"
-        for hour_stat in stats['hourly_stats'][-8:]:  # Последние 8 часов
+        for hour_stat in stats['hourly_stats'][-8:]:
             text += f"• {hour_stat['hour']}:00 - {hour_stat['scans']} сканирований\n"
     
     keyboard = [
@@ -3501,7 +3227,6 @@ async def qr_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def qr_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок статистики QR"""
     query = update.callback_query
     await query.answer()
     
@@ -3511,7 +3236,7 @@ async def qr_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await qr_stats_command(update, context)
     
     elif data == "qr_clear_cache":
-        cleared = qr_manager.clear_cache(older_than=3600)  # Старше часа
+        cleared = qr_manager.clear_cache(older_than=3600)
         await query.edit_message_text(
             f"🧹 *Кэш QR-кодов очищен*\n\n"
             f"Удалено файлов: {cleared}",
@@ -3520,9 +3245,7 @@ async def qr_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
         await qr_stats_command(update, context)
 
-# ========== КЛАВИАТУРЫ ==========
 def get_role_selection_keyboard(user_id: int):
-    """Клавиатура выбора роли"""
     keyboard = []
     
     is_admin = user_id in ADMIN_IDS
@@ -3539,7 +3262,6 @@ def get_role_selection_keyboard(user_id: int):
     return InlineKeyboardMarkup(keyboard)
 
 def get_main_menu_keyboard(user_role: str = "user"):
-    """Клавиатура главного меню"""
     if user_role == "admin":
         keyboard = [
             [InlineKeyboardButton("💰 Узнать цену", callback_data="price_info"),
@@ -3571,7 +3293,6 @@ def get_main_menu_keyboard(user_role: str = "user"):
     return InlineKeyboardMarkup(keyboard)
 
 def get_admin_dashboard_keyboard():
-    """Клавиатура панели управления"""
     keyboard = [
         [InlineKeyboardButton("📤 Экспорт данных", callback_data="admin_export"),
          InlineKeyboardButton("💾 Создать бэкап", callback_data="admin_backup")],
@@ -3583,7 +3304,6 @@ def get_admin_dashboard_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_ticket_type_keyboard():
-    """Клавиатура выбора типа билета"""
     keyboard = [
         [InlineKeyboardButton("🎟 Обычный билет", callback_data="ticket_standard")],
         [InlineKeyboardButton("🎩 VIP билет", callback_data="ticket_vip")],
@@ -3592,7 +3312,6 @@ def get_ticket_type_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_group_size_keyboard():
-    """Клавиатура выбора количества людей"""
     keyboard = [
         [
             InlineKeyboardButton("1", callback_data="size_1"),
@@ -3619,7 +3338,6 @@ def get_group_size_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_admin_keyboard():
-    """Клавиатура администратора"""
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("📈 Панель управления", callback_data="admin_dashboard")],
@@ -3633,7 +3351,6 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_promoter_keyboard():
-    """Клавиатура промоутера"""
     keyboard = [
         [InlineKeyboardButton("📋 Активные заявки", callback_data="promoter_active")],
         [InlineKeyboardButton("⏳ Отложенные", callback_data="promoter_deferred")],
@@ -3645,7 +3362,6 @@ def get_promoter_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_scan_menu_keyboard():
-    """Клавиатура меню сканирования"""
     keyboard = [
         [InlineKeyboardButton("📱 Начать сканирование", callback_data="scan_qr_start")],
         [InlineKeyboardButton("📊 Статистика сканирований", callback_data="scan_stats")],
@@ -3655,7 +3371,6 @@ def get_scan_menu_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_admin_settings_keyboard():
-    """Клавиатура настроек администратора"""
     keyboard = [
         [InlineKeyboardButton("💰 Изменить цены", callback_data="edit_prices")],
         [InlineKeyboardButton("📞 Изменить контакты", callback_data="edit_contacts")],
@@ -3665,7 +3380,6 @@ def get_admin_settings_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_reset_stats_keyboard():
-    """Клавиатура сброса статистики"""
     keyboard = [
         [InlineKeyboardButton("✅ Да, сбросить всё", callback_data="confirm_reset_all")],
         [InlineKeyboardButton("👥 Сбросить только список гостей", callback_data="confirm_reset_guests")],
@@ -3674,7 +3388,6 @@ def get_reset_stats_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_price_edit_keyboard():
-    """Клавиатура редактирования цен"""
     settings = event_settings.get_all_settings()
     keyboard = [
         [InlineKeyboardButton(f"Стандартная: {settings['price_standard']}₽", callback_data="edit_price_standard")],
@@ -3686,7 +3399,6 @@ def get_price_edit_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_contacts_edit_keyboard():
-    """Клавиатура редактирования контактов"""
     settings = event_settings.get_all_settings()
     keyboard = [
         [InlineKeyboardButton(f"Telegram: {settings['contact_telegram']}", callback_data="edit_contact_telegram")],
@@ -3695,7 +3407,6 @@ def get_contacts_edit_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_confirmation_keyboard():
-    """Клавиатура подтверждения покупки"""
     keyboard = [
         [InlineKeyboardButton("✅ Купить билет", callback_data="confirm_buy")],
         [InlineKeyboardButton("❌ Отменить", callback_data="cancel_buy")]
@@ -3703,7 +3414,6 @@ def get_confirmation_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_order_actions_keyboard(order_id: str, user_id: int, username: str = None, is_own_order: bool = False):
-    """Клавиатура действий с заказом для промоутера"""
     keyboard = []
     
     if not is_own_order:
@@ -3725,14 +3435,12 @@ def get_order_actions_keyboard(order_id: str, user_id: int, username: str = None
     return InlineKeyboardMarkup(keyboard)
 
 def get_back_to_promoter_keyboard():
-    """Клавиатура возврата в меню промоутера"""
     keyboard = [
         [InlineKeyboardButton("🔙 В меню промоутера", callback_data="promoter_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_promo_management_keyboard():
-    """Клавиатура управления промокодами"""
     keyboard = [
         [InlineKeyboardButton("➕ Создать промокод", callback_data="admin_create_promo")],
         [InlineKeyboardButton("📋 Список промокодов", callback_data="admin_view_promo_list")],
@@ -3741,16 +3449,13 @@ def get_promo_management_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def get_user_order_actions_keyboard(order_id: str):
-    """Клавиатура действий с заказом для пользователя"""
     keyboard = [
         [InlineKeyboardButton("🎫 Получить QR-код билета", callback_data=f"get_qr_{order_id}")],
         [InlineKeyboardButton("🔙 Назад", callback_data="my_orders")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ========== ФОРМАТИРОВАНИЕ ==========
 def format_price_info() -> str:
-    """Форматировать информацию о ценах"""
     settings = event_settings.get_all_settings()
     
     text = (
@@ -3767,7 +3472,6 @@ def format_price_info() -> str:
     return text
 
 def format_price_calculation(group_size: int, ticket_type: str = "standard") -> str:
-    """Форматировать расчет цены"""
     settings = event_settings.get_all_settings()
     
     if ticket_type == "vip":
@@ -3802,7 +3506,6 @@ def format_price_calculation(group_size: int, ticket_type: str = "standard") -> 
     return text
 
 def format_order_summary(name: str, email: str, group_size: int, guests: List[str], ticket_type: str = "standard") -> str:
-    """Форматировать сводку заказа"""
     settings = event_settings.get_all_settings()
     total = event_settings.calculate_price(group_size, ticket_type)
     
@@ -3836,7 +3539,6 @@ def format_order_summary(name: str, email: str, group_size: int, guests: List[st
     return summary
 
 def format_event_info() -> str:
-    """Форматировать информацию о мероприятии"""
     event_info_text = event_settings.get_all_settings().get('event_info_text', '')
     
     if event_info_text:
@@ -3880,7 +3582,6 @@ def format_event_info() -> str:
         return text
 
 def format_order_details_for_promoter(order: Dict, is_own_order: bool = False) -> str:
-    """Форматировать детали заказа для промоутера"""
     try:
         guests = db.get_order_guests(order['order_id'])
         
@@ -3953,7 +3654,6 @@ def format_order_details_for_promoter(order: Dict, is_own_order: bool = False) -
         return f"📋 *Детали заказа #{order['order_id']}*\n\n👤 *Контакт:* {escape_markdown(str(order['user_name']))}\n💰 *Сумма:* {order['total_amount']} ₽"
 
 def format_statistics() -> str:
-    """Форматировать статистику"""
     stats = db.get_statistics()
     scan_stats = db.get_scan_stats()
     
@@ -3986,14 +3686,11 @@ def format_statistics() -> str:
     
     return text
 
-# ========== ОСНОВНЫЕ КОМАНДЫ ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик команды /start с поддержкой параметров"""
     try:
         user = update.effective_user
         message_text = update.message.text
         
-        # Проверяем рейт-лимит
         if not rate_limiter.check_limit(user.id):
             remaining = rate_limiter.get_remaining(user.id)
             await update.message.reply_text(
@@ -4015,17 +3712,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         
         context.user_data.clear()
         
-        # Проверяем, есть ли параметры в команде /start
         if ' ' in message_text:
             params = message_text.split(' ', 1)[1]
             
-            # Если параметр начинается с order_, это переход на заказ
             if params.startswith('order_'):
                 order_id = params.replace('order_', '')
                 order = db.get_order(order_id)
                 
                 if order and user.id in PROMOTER_IDS:
-                    # Проверяем, не свой ли это заказ
                     own_order = is_own_order(order, user.id)
                     
                     if own_order:
@@ -4036,7 +3730,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                             parse_mode=ParseMode.MARKDOWN
                         )
                     else:
-                        # Показываем детали заказа
                         username = user.username or f"user_{user.id}"
                         context.user_data['user_role'] = 'promoter'
                         
@@ -4076,9 +3769,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Произошла ошибка при запуске бота.")
         return MAIN_MENU
 
-# ========== ОБРАБОТЧИКИ КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
     
@@ -4086,7 +3777,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     username = query.from_user.username or f"user_{user_id}"
     data = query.data
     
-    # Проверяем рейт-лимит
     if not rate_limiter.check_limit(user_id):
         remaining = rate_limiter.get_remaining(user_id)
         await query.edit_message_text(
@@ -4237,9 +3927,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if len(orders_text) > 4096:
                     orders_text = orders_text[:4000] + "...\n\n⚠️ Слишком много заказов, показаны только последние."
                 
-                # Создаем кнопки для каждого заказа (для закрытых заказов - QR-код)
                 keyboard_buttons = []
-                for order in orders[:5]:  # Максимум 5 заказов для кнопок
+                for order in orders[:5]:
                     if order['status'] == 'closed':
                         keyboard_buttons.append([
                             InlineKeyboardButton(
@@ -4266,7 +3955,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             order = db.get_order(order_id)
             
             if order and order['user_id'] == user_id:
-                # Пользователь запрашивает QR-код своего заказа
                 await generate_ticket_qr(update, context, order['order_code'])
                 return MAIN_MENU
             else:
@@ -5054,7 +4742,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     
                     await send_order_notification_to_user(context, order, "closed", username)
                     
-                    # Помечаем заказ как обработанный
                     db.mark_order_processed(order_id)
                     
                     await query.edit_message_text(
@@ -5169,7 +4856,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return ROLE_SELECTION
         
-        # Обработчики для QR-кодов
         elif data == "scan_qr_menu":
             if user_id in SCANNER_IDS:
                 await query.edit_message_text(
@@ -5313,13 +4999,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         return MAIN_MENU
 
-# ========== ОБРАБОТЧИКИ ТЕКСТОВЫХ СООБЩЕНИЙ ==========
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
-    # Проверяем рейт-лимит
     if not rate_limiter.check_limit(user_id):
         remaining = rate_limiter.get_remaining(user_id)
         await update.message.reply_text(
@@ -5332,7 +5015,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     db.update_user_request(user_id)
     
     try:
-        # Проверяем, находимся ли мы в режиме сканирования QR
         if context.user_data.get('scan_mode', False):
             return await handle_qr_scan(update, context)
         
@@ -5573,11 +5255,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                     return ADMIN_EDIT_TEXT
         
         elif context.user_data.get('creating_promo', False):
-            # Создание промокода
             promo_step = context.user_data.get('promo_step', 'code')
             
             if promo_step == 'code':
-                # Проверяем код промокода
                 if not re.match(r'^[A-Za-z0-9]+$', text):
                     await update.message.reply_text(
                         "❌ *Некорректный код промокода*\n\n"
@@ -5587,7 +5267,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                     )
                     return ADMIN_CREATE_PROMO
                 
-                # Проверяем, не существует ли уже такой промокод
                 existing_promo = db.get_promo_code(text.upper())
                 if existing_promo:
                     await update.message.reply_text(
@@ -5692,7 +5371,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 if max_uses < 0:
                     max_uses = 1
                 
-                # Создаем промокод
                 promo_code = context.user_data['promo_code']
                 discount_type = context.user_data['promo_discount_type']
                 discount_value = context.user_data['promo_discount_value']
@@ -5703,12 +5381,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                     discount_type=discount_type,
                     discount_value=discount_value,
                     max_uses=max_uses if max_uses > 0 else None,
-                    valid_until=None,  # Можно добавить срок действия
+                    valid_until=None,
                     created_by=created_by
                 )
                 
                 if success:
-                    # Форматируем информацию о промокоде
                     if discount_type == 'percent':
                         discount_text = f"{discount_value}%"
                     else:
@@ -5731,18 +5408,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                         parse_mode=ParseMode.MARKDOWN
                     )
                 
-                # Очищаем данные
                 context.user_data.pop('creating_promo', None)
                 context.user_data.pop('promo_step', None)
                 context.user_data.pop('promo_code', None)
                 context.user_data.pop('promo_discount_type', None)
                 context.user_data.pop('promo_discount_value', None)
                 
-                # Возвращаемся к управлению промокодами
                 return await promo_manage_command(update, context)
         
         elif context.user_data.get('viewing_promo', False):
-            # Просмотр информации о промокоде
             promo_code = text.upper()
             promo = db.get_promo_code(promo_code)
             
@@ -5753,7 +5427,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 )
                 return ADMIN_VIEW_PROMO
             
-            # Форматируем информацию о промокоде
             status = "🟢 Активен" if promo['is_active'] else "🔴 Неактивен"
             
             if promo['discount_type'] == 'percent':
@@ -5832,9 +5505,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         role = get_user_role(user_id)
         return MAIN_MENU
 
-# ========== КОМАНДЫ ДЛЯ АДМИНИСТРАТОРОВ ==========
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Панель управления с графиками и аналитикой"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS + PROMOTER_IDS:
@@ -5854,7 +5525,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     
     try:
-        # Проверяем, откуда пришел запрос
         if update.callback_query:
             query = update.callback_query
             await query.answer()
@@ -5872,10 +5542,8 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = db.get_statistics()
         scan_stats = db.get_scan_stats() if user.id in SCANNER_IDS else {}
         
-        # Формируем текст панели
         text = "📈 *ПАНЕЛЬ УПРАВЛЕНИЯ SMILE PARTY*\n\n"
         
-        # Основная статистика
         text += "📊 *ОСНОВНАЯ СТАТИСТИКА:*\n"
         text += f"• Всего заказов: {stats.get('total_orders', 0)}\n"
         text += f"• Активные: {stats.get('active_orders', 0)}\n"
@@ -5883,18 +5551,15 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• Выручка: {stats.get('revenue', 0)} ₽\n"
         text += f"• Гостей в списках: {stats.get('total_guests', 0)}\n\n"
         
-        # Статистика за сегодня
         text += "📅 *СЕГОДНЯ:*\n"
         text += f"• Новых заказов: {stats.get('today_orders', 0)}\n"
         text += f"• Выручка: {stats.get('today_revenue', 0)} ₽\n"
         text += f"• Уникальных покупателей: {stats.get('today_users', 0)}\n\n"
         
-        # Статистика по типам билетов
         text += "🎫 *СТАТИСТИКА ПО БИЛЕТАМ:*\n"
         text += f"• Обычные: {stats.get('standard_tickets', 0)} ({stats.get('standard_revenue', 0)} ₽)\n"
         text += f"• VIP: {stats.get('vip_tickets', 0)} ({stats.get('vip_revenue', 0)} ₽)\n\n"
         
-        # Статистика сканирований QR-кодов
         if scan_stats:
             text += "📱 *СТАТИСТИКА СКАНИРОВАНИЙ:*\n"
             text += f"• Всего сканирований: {scan_stats.get('total_scans', 0)}\n"
@@ -5904,7 +5569,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"• Отсканировано билетов: {scan_stats.get('scanned_tickets', 0)}/{scan_stats.get('total_valid_tickets', 0)}\n"
             text += f"• Сегодня: {scan_stats.get('today_scans', 0)} (успешно: {scan_stats.get('today_success', 0)})\n\n"
             
-            # Последние сканирования
             if scan_stats.get('recent_scans'):
                 text += "📋 *ПОСЛЕДНИЕ СКАНИРОВАНИЯ:*\n"
                 for scan in scan_stats['recent_scans'][:5]:
@@ -5918,25 +5582,22 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text += f"{emoji} {time_str} - @{scan['scanner_username']} - {scan['order_code']}\n"
                 text += "\n"
         
-        # Статистика за 7 дней (текстовый график)
         weekly_stats = stats.get('weekly_stats', [])
         if weekly_stats:
             text += "📆 *СТАТИСТИКА ЗА 7 ДНЕЙ:*\n"
             
-            # Находим максимальное количество заказов для масштабирования
             max_orders = max([day['orders'] for day in weekly_stats] + [1])
             
-            for day in weekly_stats[-7:]:  # Последние 7 дней
+            for day in weekly_stats[-7:]:
                 date_str = day['date']
                 if isinstance(date_str, str):
-                    date_display = date_str[-5:]  # Показываем только день и месяц
+                    date_display = date_str[-5:]
                 else:
                     date_display = date_str.strftime('%d.%m')
                 
                 orders = day['orders']
                 revenue = day['revenue'] or 0
                 
-                # Создаем текстовый график
                 bar_length = int((orders / max_orders) * 20)
                 bar = '█' * bar_length + '░' * (20 - bar_length)
                 
@@ -5944,7 +5605,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             text += "\n"
         
-        # Топ промоутеров
         top_promoters = stats.get('top_promoters', [])
         if top_promoters:
             text += "🏆 *ТОП ПРОМОУТЕРОВ:*\n"
@@ -5952,14 +5612,12 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"{i}. @{promoter['username']}: {promoter['closed_count']} зак. ({promoter['total_revenue']} ₽)\n"
             text += "\n"
         
-        # Топ сканеров
         if scan_stats and scan_stats.get('top_scanners'):
             text += "📱 *ТОП СКАНЕРОВ:*\n"
             for i, scanner in enumerate(scan_stats['top_scanners'][:3], 1):
                 text += f"{i}. @{scanner['scanner_username']}: {scanner['scan_count']} сканирований\n"
             text += "\n"
         
-        # Активные пользователи
         top_users = db.get_top_users(5)
         if top_users:
             text += "👥 *САМЫЕ АКТИВНЫЕ ПОЛЬЗОВАТЕЛИ:*\n"
@@ -5969,7 +5627,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 request_count = user_data.get('request_count', 0)
                 text += f"{i}. {first_name} (@{username}): {request_count} запросов\n"
         
-        # Кнопки управления
         keyboard = []
         if user.id in ADMIN_IDS:
             keyboard.append([
@@ -5984,7 +5641,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📊 Расширенная статистика QR", callback_data="qr_stats_refresh")
             ])
         
-        # Кнопка сканирования QR для промоутеров и администраторов
         if user.id in SCANNER_IDS:
             keyboard.append([
                 InlineKeyboardButton("📱 Сканировать QR-код", callback_data="scan_qr_menu")
@@ -5995,7 +5651,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔙 Назад", callback_data="admin_back")
         ])
         
-        # Используем правильный метод для ответа
         if update.callback_query:
             await update.callback_query.edit_message_text(
                 text,
@@ -6030,7 +5685,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экспорт данных в CSV"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -6046,7 +5700,6 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         
-        # Получаем все закрытые заказы
         orders = db.get_orders_by_status("closed")
         
         if not orders:
@@ -6056,18 +5709,15 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Создаем CSV в памяти
         output = io.StringIO()
         writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
         
-        # Заголовки
         writer.writerow([
             'ID заказа', 'Код заказа', 'Тип билета', 'Имя', 'Email', 
             'Telegram', 'Кол-во гостей', 'Сумма', 'Дата создания', 
             'Дата закрытия', 'Промоутер', 'Статус', 'Отсканирован', 'Сканирован', 'Версия QR'
         ])
         
-        # Данные
         for order in orders:
             created_at = order['created_at']
             if isinstance(created_at, str):
@@ -6106,11 +5756,9 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 qr_version
             ])
         
-        # Готовим файл для отправки
         output.seek(0)
-        csv_data = output.getvalue().encode('utf-8-sig')  # UTF-8 с BOM для Excel
+        csv_data = output.getvalue().encode('utf-8-sig')
         
-        # Отправляем файл
         await update.message.reply_document(
             document=io.BytesIO(csv_data),
             filename=f"orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
@@ -6127,7 +5775,6 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создание резервной копии базы данных"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -6141,16 +5788,13 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     backup_sql = f"{backup_file}.sql"
     
     try:
-        # Копируем файл базы данных
         shutil.copy2(DB_FILE, backup_file)
         
-        # Создаем SQL дамп
         with closing(sqlite3.connect(DB_FILE)) as conn:
             with open(backup_sql, 'w', encoding='utf-8') as f:
                 for line in conn.iterdump():
                     f.write(f'{line}\n')
         
-        # Отправляем файл базы данных
         with open(backup_file, 'rb') as f:
             await update.message.reply_document(
                 document=f,
@@ -6158,7 +5802,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="💾 Резервная копия базы данных"
             )
         
-        # Отправляем SQL дамп
         with open(backup_sql, 'rb') as f:
             await update.message.reply_document(
                 document=f,
@@ -6166,7 +5809,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="📝 SQL дамп базы данных"
             )
         
-        # Очистка
         os.remove(backup_file)
         os.remove(backup_sql)
         
@@ -6183,7 +5825,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для рассылки сообщений всем пользователям"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -6196,7 +5837,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         message = ' '.join(context.args)
         
-        # Получаем всех пользователей
         users = db.get_all_users()
         
         await update.message.reply_text(
@@ -6215,7 +5855,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN
                 )
                 success += 1
-                await asyncio.sleep(0.1)  # Ограничение скорости
+                await asyncio.sleep(0.1)
             except Exception as e:
                 failed += 1
                 logger.error(f"Ошибка отправки пользователю {user_data['user_id']}: {e}")
@@ -6235,11 +5875,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для отправки логов в канал"""
     try:
         user = update.effective_user
         
-        # Проверяем рейт-лимит
         if not rate_limiter.check_limit(user.id):
             remaining = rate_limiter.get_remaining(user.id)
             await update.message.reply_text(
@@ -6334,10 +5972,8 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /help"""
     user = update.effective_user
     
-    # Проверяем рейт-лимит
     if not rate_limiter.check_limit(user.id):
         remaining = rate_limiter.get_remaining(user.id)
         await update.message.reply_text(
@@ -6398,10 +6034,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 async def notify_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для отправки уведомлений всем пользователям"""
     user = update.effective_user
     
-    # Проверяем рейт-лимит
     if not rate_limiter.check_limit(user.id):
         remaining = rate_limiter.get_remaining(user.id)
         await update.message.reply_text(
@@ -6433,10 +6067,8 @@ async def notify_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 async def check_new_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для ручной проверки новых заказов"""
     user = update.effective_user
     
-    # Проверяем рейт-лимит
     if not rate_limiter.check_limit(user.id):
         remaining = rate_limiter.get_remaining(user.id)
         await update.message.reply_text(
@@ -6481,10 +6113,8 @@ async def check_new_orders_command(update: Update, context: ContextTypes.DEFAULT
         )
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик команды /cancel"""
     user = update.effective_user
     
-    # Проверяем рейт-лимит
     if not rate_limiter.check_limit(user.id):
         remaining = rate_limiter.get_remaining(user.id)
         await update.message.reply_text(
@@ -6530,7 +6160,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return MAIN_MENU
 
 async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Управление промокодами"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -6547,7 +6176,6 @@ async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return MAIN_MENU
     
-    # Получаем все промокоды
     promos = db.get_all_promo_codes()
     
     if not promos:
@@ -6558,7 +6186,6 @@ async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYP
         text = "🎫 *Управление промокодами*\n\n"
         text += f"Всего промокодов: {len(promos)}\n\n"
         
-        # Показываем последние 10 промокодов
         for promo in promos[:10]:
             status = "🟢" if promo['is_active'] else "🔴"
             
@@ -6575,7 +6202,6 @@ async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if len(promos) > 10:
             text += f"\n...и еще {len(promos) - 10} промокодов"
     
-    # Создаем клавиатуру
     keyboard = [
         [InlineKeyboardButton("➕ Создать промокод", callback_data="admin_create_promo")],
         [InlineKeyboardButton("🔍 Найти промокод", callback_data="admin_view_promo")],
@@ -6597,15 +6223,11 @@ async def promo_manage_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ADMIN_MENU
 
-# ========== ПЕРИОДИЧЕСКИЕ ЗАДАЧИ ==========
 async def periodic_notification_check(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическая проверка и отправка уведомлений о новых заказах и напоминаний"""
     await check_and_send_notifications(context)
     await send_reminders(context)
 
-# ========== УВЕДОМЛЕНИЯ ПРИ ЗАПУСКЕ ==========
 async def send_restart_notifications_async(bot_token: str):
-    """Асинхронная функция для отправки уведомлений о перезапуске"""
     try:
         from telegram import Bot
         
@@ -6636,13 +6258,10 @@ async def send_restart_notifications_async(bot_token: str):
         logger.error(f"Ошибка при отправке уведомлений при перезапуске: {e}")
 
 def send_restart_notifications():
-    """Синхронная функция для отправки уведомлений о перезапуске"""
     import asyncio
     asyncio.run(send_restart_notifications_async(BOT_TOKEN))
 
-# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main() -> None:
-    """Основная функция запуска бота"""
     logger.info("🚀 Запуск SMILE PARTY Bot с ULTIMATE QR SYSTEM...")
     logger.info(f"👥 Права на сканирование QR-кодов имеют {len(SCANNER_IDS)} пользователей")
     logger.info(f"🔒 Защита QR-кодов: HMAC + Timestamp + Версионирование")
@@ -6657,22 +6276,15 @@ def main() -> None:
     
     db.reset_notification_status()
     
-    # Создание приложения
     application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
     
-    # Настройка периодических задач
     try:
         job_queue = application.job_queue
         if job_queue:
-            # Проверка новых заказов каждые 30 секунд
             job_queue.run_repeating(periodic_notification_check, interval=30, first=10)
-            
-            # Отправка напоминаний каждые 30 минут
             job_queue.run_repeating(send_reminders, interval=1800, first=300)
-            
-            # Очистка старого кэша раз в день
-            job_queue.run_once(lambda _: qr_manager.clear_cache(86400), when=3600)  # Через час после запуска
-            job_queue.run_daily(lambda _: qr_manager.clear_cache(86400), time=datetime.time(hour=3, minute=0))  # Каждый день в 3 часа
+            job_queue.run_once(lambda _: qr_manager.clear_cache(86400), when=3600)
+            job_queue.run_daily(lambda _: qr_manager.clear_cache(86400), time=datetime.time(hour=3, minute=0))
             
             logger.info("✅ Запущены периодические задачи")
         else:
@@ -6680,7 +6292,6 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"⚠️ JobQueue не доступен: {e}")
     
-    # Настройка обработчика диалогов
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
@@ -6748,7 +6359,6 @@ def main() -> None:
         ]
     )
     
-    # Добавление обработчиков
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("notify_all", notify_all_command))
@@ -6767,7 +6377,6 @@ def main() -> None:
     logger.info(f"📱 Команды QR: /scanqr, /scanstats, /qrstats")
     logger.info(f"🔒 Все QR-коды защищены HMAC подписью и временной меткой")
     
-    # Запуск отправки уведомлений о перезапуске в фоновом режиме
     import threading
     import time
     
@@ -6780,7 +6389,6 @@ def main() -> None:
     notification_thread.daemon = True
     notification_thread.start()
     
-    # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
