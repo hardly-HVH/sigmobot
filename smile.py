@@ -975,7 +975,6 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(order_code)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_qr_hash ON orders(qr_hash)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_guests_order_id ON guests(order_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_guests_order_code ON guests(order_code)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_guests_guest_hash ON guests(guest_hash)")
@@ -1019,9 +1018,34 @@ class Database:
             logger.error(f"❌ Ошибка добавления колонки {column_name}: {e}")
             return False
     
+    def add_index_if_not_exists(self, index_name: str, table_name: str, column_name: str):
+        try:
+            with closing(self.get_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='index' AND name='{index_name}'")
+                result = cursor.fetchone()
+                
+                if not result:
+                    try:
+                        cursor.execute(f"CREATE INDEX {index_name} ON {table_name}({column_name})")
+                        conn.commit()
+                        logger.info(f"✅ Создан индекс {index_name} на {table_name}({column_name})")
+                        return True
+                    except sqlite3.OperationalError as e:
+                        if "no such column" in str(e):
+                            logger.warning(f"⚠️ Колонка {column_name} еще не существует, индекс {index_name} будет создан позже")
+                            return False
+                        else:
+                            raise e
+                return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания индекса {index_name}: {e}")
+            return False
+    
     def check_and_fix_database(self):
         logger.info("🔧 Проверка структуры базы данных...")
         
+        # Добавляем недостающие колонки
         self.add_column_if_not_exists("orders", "ticket_type", "VARCHAR(10) DEFAULT 'standard'")
         self.add_column_if_not_exists("bot_users", "notified_about_restart", "BOOLEAN DEFAULT FALSE")
         self.add_column_if_not_exists("orders", "notified_promoters", "BOOLEAN DEFAULT FALSE")
@@ -1042,6 +1066,9 @@ class Database:
         self.add_column_if_not_exists("scan_logs", "qr_version", "VARCHAR(10)")
         self.add_column_if_not_exists("scan_logs", "signature_valid", "BOOLEAN")
         self.add_column_if_not_exists("scan_logs", "timestamp_valid", "BOOLEAN")
+        
+        # Создаем индексы с проверкой существования колонок
+        self.add_index_if_not_exists("idx_orders_qr_hash", "orders", "qr_hash")
         
         logger.info("✅ Структура базы данных проверена")
     
